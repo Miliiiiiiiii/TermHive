@@ -1,8 +1,6 @@
 # TermHive（蜂巢终端）
 
-> 前身/工程名 DBX Shell。插件 id 为 `com.milii.termhive`（发布者 milii，产品 TermHive），显示名与 id 自 0.1.0 起统一为 TermHive。
-
-DBX 插件：SSH 终端 + SFTP 文件管理，用来替代 Xshell / Xftp。连接保存在 DBX 原生连接列表里，双击连接即在 DBX 标签页内打开终端与文件面板。
+DBX 插件：SSH 终端 + SFTP 文件管理，用来替代 Xshell / Xftp。连接保存在 DBX 原生连接列表里，双击连接即在 DBX 标签页内打开终端与文件面板。插件 id 为 `com.milii.termhive`（发布者 milii）。
 
 ## 功能
 
