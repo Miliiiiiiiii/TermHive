@@ -1,0 +1,16 @@
+schema_version = 1
+
+[backend]
+language = "go"
+directory = "backend"
+binary = "dbx-plugin-termhive"
+
+[package]
+include = ["assets", "ui/dist"]
+
+# The eval indirection works around Node failing to resolve a relative main
+# module when the dev host spawns it with a \\?\ long-path cwd on Windows;
+# pathToFileURL(import) is immune to that.
+[dev]
+ui_build = ["node", "--eval", "const{pathToFileURL:r}=require('url'),{join:j}=require('path');import(r(j(process.cwd(),'scripts','build-ui.mjs')).href)"]
+ui_watch = ["node", "--eval", "process.env.DBX_UI_WATCH='1';const{pathToFileURL:r}=require('url'),{join:j}=require('path');import(r(j(process.cwd(),'scripts','build-ui.mjs')).href)"]

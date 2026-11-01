@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    # The e2e harness and sidecar paths are Windows-first (the plugin's
+    # primary target); keep the gate on windows-latest.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install UI dependencies
+        run: npm install && npm --prefix ui install
+
+      - name: Backend vet + unit tests
+        working-directory: backend
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Build sidecar and test server
+        shell: bash
+        run: |
+          go -C backend build -ldflags "-s -w" -o bin/dbx-plugin-termhive.exe .
+          go -C tools/testsrv build -o testsrv.exe .
+
+      - name: Build UI
+        run: npm run build:ui
+
+      - name: Checks (version consistency, typecheck, built-CSS markers)
+        run: npm run check
+
+      - name: Protocol smoke test
+        run: node scripts/proto-test.mjs backend/bin/dbx-plugin-termhive.exe
+
+      - name: End-to-end test (embedded SSH+SFTP server)
+        run: node scripts/e2e-test.mjs
+
+      - name: PTY modes test (real pty-req capture; needs python+paramiko)
+        shell: bash
+        run: |
+          python -m pip install --quiet paramiko
+          node scripts/pty-modes-test.mjs

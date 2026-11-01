@@ -1,0 +1,20 @@
+{
+  "name": "termhive-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "node ../scripts/build-ui.mjs",
+    "watch": "node ../scripts/build-ui.mjs --watch"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/addon-search": "^0.15.0",
+    "@xterm/addon-web-links": "^0.11.0",
+    "@xterm/addon-webgl": "^0.18.0",
+    "@xterm/xterm": "^5.5.0"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true
+  }
+}

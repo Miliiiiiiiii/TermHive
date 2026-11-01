@@ -1,0 +1,24 @@
+{
+  "name": "termhive",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build:ui": "node scripts/build-ui.mjs",
+    "watch:ui": "node scripts/build-ui.mjs --watch",
+    "preview": "node scripts/build-ui.mjs && npx http-server ui/dist -p 5390 -o",
+    "test": "node scripts/proto-test.mjs backend/bin/dbx-plugin-termhive.exe && node scripts/e2e-test.mjs",
+    "test:pty": "node scripts/pty-modes-test.mjs",
+    "check": "node scripts/check-version.mjs && node scripts/check-changelog.mjs && npx tsc -p ui --noEmit && node scripts/check-build.mjs",
+    "release:patch": "node scripts/release.mjs patch",
+    "release:minor": "node scripts/release.mjs minor"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vite": "^6.0.0",
+    "vite-plugin-singlefile": "^2.0.0"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true
+  }
+}

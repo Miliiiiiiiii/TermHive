@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="TermHive (hex cluster)">
+  <defs>
+    <linearGradient id="bg2" x1="8" y1="6" x2="56" y2="58" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#141a26"/>
+      <stop offset="1" stop-color="#0d1017"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="url(#bg2)"/>
+  <!-- three hives: the grouping concept; the focused one carries the prompt -->
+  <path d="M22 14l9 5.2v10.4L22 34.8l-9-5.2V19.2L22 14Z" fill="none" stroke="#475569" stroke-width="2.6" stroke-linejoin="round"/>
+  <path d="M42 14l9 5.2v10.4L42 34.8l-9-5.2V19.2L42 14Z" fill="none" stroke="#475569" stroke-width="2.6" stroke-linejoin="round"/>
+  <path d="M32 30l11 6.4v12.8L32 55.6 21 49.2V36.4L32 30Z" fill="#1d4ed8" fill-opacity="0.22" stroke="#60a5fa" stroke-width="3.4" stroke-linejoin="round"/>
+  <path d="M27 39l4 3.4-4 3.4" fill="none" stroke="#f4f4f5" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M34 45.8h5" stroke="#f4f4f5" stroke-width="3" stroke-linecap="round"/>
+</svg>

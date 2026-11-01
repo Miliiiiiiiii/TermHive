@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="TermHive">
+  <defs>
+    <linearGradient id="bg" x1="8" y1="6" x2="56" y2="58" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1e2430"/>
+      <stop offset="1" stop-color="#10131a"/>
+    </linearGradient>
+    <linearGradient id="hex" x1="16" y1="10" x2="48" y2="54" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7cb2ff"/>
+      <stop offset="1" stop-color="#3b82f6"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="url(#bg)"/>
+  <path d="M32 8l17.3 10v20L32 48 14.7 38V18L32 8Z" fill="none" stroke="url(#hex)" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M23 24l6 5-6 5" fill="none" stroke="#f4f4f5" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M33 34h9" stroke="#f4f4f5" stroke-width="3.6" stroke-linecap="round"/>
+</svg>

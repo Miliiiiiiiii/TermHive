@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DBX Shell</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script>
+      // The desktop host's CSP is stricter than the dev host's and can block
+      // inline <style>, stripping the whole design system. Re-attach the
+      // stylesheet through channels CSP cannot block: a constructable
+      // stylesheet (CSSOM is not policy-checked) plus a blob: link.
+      (function () {
+        try {
+          var css = "";
+          var styles = document.querySelectorAll("style");
+          for (var i = 0; i < styles.length; i++) css += styles[i].textContent + "\n";
+          if (!css) return;
+          if (document.adoptedStyleSheets && window.CSSStyleSheet) {
+            var sheet = new CSSStyleSheet();
+            sheet.replaceSync(css);
+            document.adoptedStyleSheets = [].concat(document.adoptedStyleSheets, [sheet]);
+          }
+          var link = document.createElement("link");
+          link.rel = "stylesheet";
+          link.href = URL.createObjectURL(new Blob([css], { type: "text/css" }));
+          document.head.appendChild(link);
+        } catch (error) {
+          /* inline styles still work in that case */
+        }
+      })();
+    </script>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

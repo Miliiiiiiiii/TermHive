@@ -1,0 +1,12 @@
+/dist/
+/.dbx-dev/
+/.todo/
+node_modules/
+ui/dist/
+backend/bin/
+tools/testsrv/testsrv.exe
+tools/ptyserver/pty-modes.json
+*.exe
+.dbx-repository-signing-key.env
+.DS_Store
+*.log
