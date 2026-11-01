@@ -413,7 +413,7 @@ func main() {
 	}
 	metadata := dbxpluginsdk.Metadata{
 		ID:           "com.milii.termhive",
-		Version:      "0.1.0",
+		Version:      "0.1.0-rc.1",
 		Capabilities: []string{"workbench", "binary"},
 	}
 	server := dbxpluginsdk.NewServer(metadata, &plugin{manager: NewManager(dataDir)})

@@ -11,7 +11,9 @@
     "test:pty": "node scripts/pty-modes-test.mjs",
     "check": "node scripts/check-version.mjs && node scripts/check-changelog.mjs && npx tsc -p ui --noEmit && node scripts/check-build.mjs",
     "release:patch": "node scripts/release.mjs patch",
-    "release:minor": "node scripts/release.mjs minor"
+    "release:minor": "node scripts/release.mjs minor",
+    "release:rc": "node scripts/release.mjs rc",
+    "release:settle": "node scripts/release.mjs settle"
   },
   "devDependencies": {
     "typescript": "^5.6.0",

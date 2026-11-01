@@ -46,3 +46,5 @@
 - proto / e2e / PTY 模式测试套件(内嵌 SSH+SFTP 测试服务器)
 - CI 门禁:版本一致性 + CHANGELOG 覆盖 + 类型检查 + 构建断言 + 全量测试
 - 发版脚本(release:patch/minor)+ GitHub Actions 自动打包 .dbxp 挂到 Release
+
+> rc 验证构建：0.1.0-rc.1（2026-11-01）
