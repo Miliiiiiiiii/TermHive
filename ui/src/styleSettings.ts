@@ -14,6 +14,9 @@ export interface StyleSettings {
   scheme: string;
   highlight: boolean;
   rules: HighlightRule[];
+  /** behavior toggles share the same settings blob (settings/put merges) */
+  autoReconnect: boolean;
+  sessionLog: boolean;
 }
 
 export function defaultStyleSettings(): StyleSettings {
@@ -21,21 +24,32 @@ export function defaultStyleSettings(): StyleSettings {
     scheme: "auto",
     highlight: true,
     rules: DEFAULT_RULES.map((rule) => ({ ...rule })),
+    autoReconnect: true,
+    sessionLog: false,
   };
+}
+
+type StoredSettings = {
+  scheme?: string;
+  highlight?: boolean;
+  rules?: HighlightRule[];
+  autoReconnect?: boolean;
+  sessionLog?: boolean;
+};
+
+function applyStored(settings: StyleSettings, stored: StoredSettings): void {
+  if (typeof stored.scheme === "string" && stored.scheme) settings.scheme = stored.scheme;
+  if (typeof stored.highlight === "boolean") settings.highlight = stored.highlight;
+  if (Array.isArray(stored.rules) && stored.rules.length > 0) settings.rules = stored.rules;
+  if (typeof stored.autoReconnect === "boolean") settings.autoReconnect = stored.autoReconnect;
+  if (typeof stored.sessionLog === "boolean") settings.sessionLog = stored.sessionLog;
 }
 
 export async function loadStyleSettings(): Promise<StyleSettings> {
   const settings = defaultStyleSettings();
   try {
-    const result = await api<{ settings: { scheme?: string; highlight?: boolean; rules?: HighlightRule[] } }>(
-      "settings/get",
-      {},
-      15000,
-    );
-    const stored = result.settings ?? {};
-    if (typeof stored.scheme === "string" && stored.scheme) settings.scheme = stored.scheme;
-    if (typeof stored.highlight === "boolean") settings.highlight = stored.highlight;
-    if (Array.isArray(stored.rules) && stored.rules.length > 0) settings.rules = stored.rules;
+    const result = await api<{ settings: StoredSettings }>("settings/get", {}, 15000);
+    applyStored(settings, result.settings ?? {});
   } catch {
     /* first run: defaults */
   }
@@ -53,6 +67,8 @@ export function saveStyleSettings(settings: StyleSettings): void {
           scheme: settings.scheme,
           highlight: settings.highlight,
           rules: settings.rules,
+          autoReconnect: settings.autoReconnect,
+          sessionLog: settings.sessionLog,
         },
       },
       15000,
@@ -65,15 +81,9 @@ export function saveStyleSettings(settings: StyleSettings): void {
 export function onStyleSettingsChanged(handler: (settings: StyleSettings) => void): () => void {
   return onSidecarEvent((message) => {
     if (message.method !== "settings.changed") return;
-    const stored = (message.params?.settings ?? {}) as {
-      scheme?: string;
-      highlight?: boolean;
-      rules?: HighlightRule[];
-    };
+    const stored = (message.params?.settings ?? {}) as StoredSettings;
     const next = defaultStyleSettings();
-    if (typeof stored.scheme === "string" && stored.scheme) next.scheme = stored.scheme;
-    if (typeof stored.highlight === "boolean") next.highlight = stored.highlight;
-    if (Array.isArray(stored.rules) && stored.rules.length > 0) next.rules = stored.rules;
+    applyStored(next, stored);
     handler(next);
   });
 }
@@ -109,11 +119,15 @@ export function renderStylePop(
       scheme: state.scheme,
       highlight: state.highlight,
       rules: state.rules.map((rule) => ({ ...rule })),
+      autoReconnect: state.autoReconnect,
+      sessionLog: state.sessionLog,
     };
     patch(next);
     state.scheme = next.scheme;
     state.highlight = next.highlight;
     state.rules = next.rules;
+    state.autoReconnect = next.autoReconnect;
+    state.sessionLog = next.sessionLog;
     onChanged(next);
     // re-render only the reactive bits would be overkill; rebuild keeps
     // every control in sync with the state it just produced
@@ -146,8 +160,23 @@ export function renderStylePop(
   toggleRow.append(highlightToggle, toggleText);
   pop.append(toggleRow);
 
-  section(t("rulesLabel"));
-  state.rules.forEach((rule, index) => {
+  section(t("behaviorLabel"));
+  const behaviorRow = (key: "autoReconnect" | "sessionLog"): void => {
+    const row = document.createElement("label");
+    row.className = "settings-row";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = state[key];
+    box.addEventListener("change", () => commit((draft) => (draft[key] = box.checked)));
+    const text = document.createElement("span");
+    text.textContent = key === "autoReconnect" ? t("autoReconnectLabel") : t("sessionLogLabel");
+    row.append(box, text);
+    pop.append(row);
+  };
+  behaviorRow("autoReconnect");
+  behaviorRow("sessionLog");
+
+  section(t("rulesLabel"));  state.rules.forEach((rule, index) => {
     const row = document.createElement("div");
     row.className = "rule-row";
     const enable = document.createElement("input");

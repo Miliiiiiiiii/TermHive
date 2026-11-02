@@ -3,7 +3,7 @@
 // uploads/downloads over the framed protocol — the same paths DBX will use.
 // Usage: node scripts/e2e-test.mjs
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
@@ -114,6 +114,21 @@ function waitFor(predicate, label, timeoutMs = 20000) {
         reject(new Error(`timeout waiting for ${label}`));
       }
     }, 25);
+  });
+}
+function waitChannelIncludes(channel, needle, label, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const timer = setInterval(() => {
+      if (channelData(channel).toString("utf8").includes(needle)) {
+        clearInterval(timer);
+        console.log(`  ok ${label}`);
+        resolve(true);
+      } else if (Date.now() - started > timeoutMs) {
+        clearInterval(timer);
+        reject(new Error(`timeout waiting for ${label}`));
+      }
+    }, 50);
   });
 }
 
@@ -284,14 +299,15 @@ try {
   // ---- MCP tool surface: discovery, gating and execution ----
   const catalog = await call("mcp/tools", { connectionId: "conn-e2e-1" });
   const names = catalog.tools.map((tool) => tool.name).sort();
-  expect(names.length === 9, `mcp/tools lists 9 tools (got ${names.length})`);
+  expect(names.length === 12, `mcp/tools lists 12 tools (got ${names.length})`);
   expect(
-    names.join(",") === "exec,exec_readonly,sftp_list_dir,sftp_mkdir,sftp_read_file,sftp_remove,sftp_rename,sftp_stat,sftp_write_file",
+    names.join(",") ===
+      "exec,exec_readonly,sftp_list_dir,sftp_mkdir,sftp_read_file,sftp_remove,sftp_rename,sftp_stat,sftp_write_file,tail_read,tail_start,tail_stop",
     "mcp/tools catalog names match",
   );
   expect(
-    catalog.tools.filter((tool) => tool.annotations?.readOnlyHint === true).length === 4,
-    "4 tools are annotated read-only",
+    catalog.tools.filter((tool) => tool.annotations?.readOnlyHint === true).length === 7,
+    "7 tools are annotated read-only",
   );
   expect(
     catalog.tools.every((tool) => tool.inputSchema?.properties?.dbx_connection && tool.inputSchema?.properties?.connectionId),
@@ -350,6 +366,36 @@ try {
     "sftp_remove refuses the filesystem root",
   );
 
+  // ---- MCP follow tools: fixed-shape commands, honest failure reporting ----
+  const tailNoArgs = await call("mcp/call", { tool: "tail_start", arguments: { connectionId: "conn-e2e-1" } });
+  expect(
+    tailNoArgs.isError === true && tailNoArgs.content[0].text.includes("path"),
+    "tail_start demands a path or unit",
+  );
+  // testsrv answers every exec by printing EXEC:<command> and exiting at
+  // once, so a follow stream "ends immediately" — the start must fail with
+  // the captured output instead of handing out a dead taskId
+  const tailImmediate = await call("mcp/call", {
+    tool: "tail_start",
+    arguments: { path: join(home.path, "up.bin"), connectionId: "conn-e2e-1" },
+  });
+  expect(
+    tailImmediate.isError === true && tailImmediate.content[0].text.includes("ended immediately"),
+    "tail_start reports an immediately-ending stream as a failed start",
+  );
+  expect(
+    tailImmediate.content[0].text.includes("EXEC:tail"),
+    "the failed follow start carries the program's output",
+  );
+  const tailUnknown = await call("mcp/call", {
+    tool: "tail_read",
+    arguments: { taskId: "tf-none", connectionId: "conn-e2e-1" },
+  });
+  expect(
+    tailUnknown.isError === true && tailUnknown.content[0].text.includes("no follow task"),
+    "tail_read refuses unknown task ids",
+  );
+
   // ---- download over down/<transferId>, acking each chunk ----
   const download = await call("transfer/startDownload", { shellId, remotePath: join(home.path, "up.bin") });
   const downId = download.transferId;
@@ -392,6 +438,32 @@ try {
   // 1 MiB of repeated payload compresses to a few KiB, so assert on entries
   expect(zipBytes.toString("latin1").includes("up.bin"), "zip contains the up.bin entry");
 
+  // ---- log follow mode: tail/<taskId> streams the file's growth ----
+  const logPath = join(home.path, "follow.log");
+  await call("fs/write", { shellId, path: logPath, contentBase64: Buffer.from("line-1\nline-2\n").toString("base64") });
+  const followStart = await call("tail/start", { shellId, path: logPath, lines: 10 });
+  const followId = followStart.taskId;
+  expect(Boolean(followId), "tail/start registers a follower");
+  // gated like downloads: nothing may flow before tail/ready (the UI demux
+  // drops unsubscribed frames)
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  expect(channelData(`tail/${followId}`).length === 0, "no follow bytes flow before tail/ready");
+  await call("tail/ready", { taskId: followId });
+  await waitChannelIncludes(`tail/${followId}`, "line-2", "initial tail window streams");
+  // growth: fs/write replaces the file with longer content; the follower
+  // (re-opening by path each poll) picks up the appended bytes
+  await call("fs/write", {
+    shellId,
+    path: logPath,
+    contentBase64: Buffer.from("line-1\nline-2\nline-3-appended\n").toString("base64"),
+  });
+  await waitChannelIncludes(`tail/${followId}`, "line-3-appended", "followed growth streams");
+  await call("tail/stop", { taskId: followId });
+  await waitFor(
+    (n) => n.method === "tail.done" && n.params.taskId === followId,
+    "follow teardown notification",
+  );
+
   // ---- second session to the same server (multi-session requirement) ----
   const second = await call("session/newShell", { connectionId: "conn-e2e-1", cols: 80, rows: 24 });
   expect(Boolean(second.shellId) && second.shellId !== shellId, "newShell opens an independent second shell");
@@ -427,6 +499,24 @@ try {
     channelData(`term/${second.shellId}`).toString("utf8").includes("ECHO:still-alive"),
     "attach replays ring buffer",
   );
+
+  // ---- session logging: toggle on via merged settings, output lands on disk
+  // with per-line timestamps in a per-connection directory ----
+  await call("settings/put", { settings: { sessionLog: true } });
+  const merged = await call("settings/get");
+  expect(merged.settings?.scheme === "oneDark", "settings/put merges instead of replacing");
+  sendBinary(`term/${second.shellId}`, Buffer.from("log-me-please\n", "utf8"));
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  const logDir = join(dataDir, "logs");
+  const connDirs = readdirSync(logDir);
+  expect(connDirs.length === 1 && connDirs[0] === "tester@127.0.0.1_" + port, "session logs land in a per-connection directory");
+  const logFiles = readdirSync(join(logDir, connDirs[0]));
+  const sessionLog = logFiles
+    .map((name) => readFileSync(join(logDir, connDirs[0], name), "utf8"))
+    .find((text) => text.includes("log-me-please"));
+  expect(Boolean(sessionLog), "session log captures terminal output");
+  expect(/^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\] /m.test(sessionLog), "session log lines carry timestamps");
+  await call("settings/put", { settings: { sessionLog: false } });
 
   // ---- sidecar restart: the host may never resend the lifecycle, so the
   // credential cache on disk must let "reconnect" redial on its own ----
@@ -491,8 +581,18 @@ try {
   );
   expect(String(hostList.hosts[0].fingerprint).startsWith("SHA256:"), "fingerprint is SHA256 format");
 
-  // ---- disconnect lifecycle tears everything down ----
-  await call("session/newShell", { connectionId: "conn-e2e-1", cols: 80, rows: 24 });
+  // ---- auto-reconnect: killing the server must wake the supervisor ----
+  server.kill();
+  const reconnecting = await waitFor(
+    (n) => n.method === "connection.reconnecting" && n.params.connectionId === "conn-e2e-1",
+    "connection.reconnecting after server death",
+    20000,
+  );
+  expect(reconnecting.params.attempt >= 1, "reconnecting reports its attempt number");
+  expect(typeof reconnecting.params.nextInMs === "number" && reconnecting.params.nextInMs > 0, "reconnecting reports the backoff delay");
+
+  // ---- disconnect lifecycle tears everything down (also cancels the
+  // supervisor retrying the dead server) ----
   await call("connection/disconnect", lifecycle());
   await new Promise((resolve) => setTimeout(resolve, 300));
   const afterDisconnect = await call("session/shells");
@@ -521,12 +621,12 @@ try {
   console.log("\ne2e test passed");
   child.kill();
   server.kill();
-  rmSync(dataDir, { recursive: true, force: true });
+  rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
   process.exit(0);
 } catch (error) {
   console.error(`\nFAILED: ${error.message}`);
   child.kill();
   server.kill();
-  rmSync(dataDir, { recursive: true, force: true });
+  rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
   process.exit(1);
 }

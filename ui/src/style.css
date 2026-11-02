@@ -807,6 +807,27 @@ input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):focus, selec
 .editor-body:disabled { opacity: 0.6; }
 .editor-body[readonly] { cursor: text; }
 
+/* ---- log follow viewer (tail -f overlay) ---- */
+.log-card { width: min(1020px, 94vw); height: min(720px, 88vh); }
+.log-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  background: var(--bg);
+}
+.log-body .xterm { padding: 8px 4px; height: 100%; }
+/* jump-to-latest pill: visible while the viewer is paused (scrolled up) */
+.log-jump {
+  position: absolute;
+  right: 18px;
+  bottom: 16px;
+  z-index: 5;
+  border-radius: 999px;
+  font-size: 12px;
+  padding: 4px 12px;
+  cursor: pointer;
+}
+
 /* refresh feedback: spin the icon while the listing reloads */
 @keyframes fp-spin { to { transform: rotate(360deg); } }
 .icon-btn.spin .ic { animation: fp-spin 0.45s ease; }

@@ -33,6 +33,10 @@ type Conn struct {
 	closed atomic.Bool
 	dead   atomic.Bool
 	done   chan struct{}
+
+	// onDead fires (own goroutine) when the keepalive pump concludes the
+	// transport is gone — the auto-reconnect supervisor listens here.
+	onDead func()
 }
 
 // DialConn establishes and authenticates the shared SSH client and starts
@@ -57,6 +61,12 @@ func (conn *Conn) Client() *ssh.Client { return conn.client }
 
 // Dead reports whether the shared transport can no longer carry sessions.
 func (conn *Conn) Dead() bool { return conn.dead.Load() }
+
+// markDead flags the transport as gone without closing it, so the next
+// manager.conn() redials instead of handing out the cached client. Used when
+// evidence ahead of the keepalive (every PTY hitting EOF) says the link is
+// down even though the keepalive round has not fired yet.
+func (conn *Conn) markDead() { conn.dead.Store(true) }
 
 func (conn *Conn) Close() {
 	if !conn.closed.CompareAndSwap(false, true) {
@@ -91,6 +101,9 @@ func (conn *Conn) pumpKeepalive(emitter *dbxpluginsdk.Emitter) {
 						"connectionId": conn.Spec.ConnectionID,
 						"reason":       err.Error(),
 					})
+				}
+				if conn.onDead != nil {
+					go conn.onDead()
 				}
 				return
 			}

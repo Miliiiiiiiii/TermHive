@@ -330,6 +330,24 @@ func (app *plugin) handle(
 		app.manager.CancelTransfer(str(values["transferId"]))
 		return map[string]any{"ok": true}, nil
 
+	// ---- log follow mode (file panel tail -f viewer) ----
+
+	case "tail/start":
+		taskID, err := app.manager.StartFollow(
+			str(values["shellId"]), str(values["path"]), intOf(values["lines"]))
+		if err != nil {
+			return nil, dbxpluginsdk.NewError(-32006, err.Error())
+		}
+		return map[string]any{"taskId": taskID}, nil
+
+	case "tail/ready":
+		app.manager.ReadyFollow(str(values["taskId"]))
+		return map[string]any{"ok": true}, nil
+
+	case "tail/stop":
+		app.manager.StopFollow(str(values["taskId"]))
+		return map[string]any{"ok": true}, nil
+
 	// ---- AI tools (DBX MCP bridge: discovery + gated execution) ----
 
 	case "mcp/tools":

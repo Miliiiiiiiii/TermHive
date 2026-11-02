@@ -168,12 +168,16 @@ export function createTerminal(
 
   // GPU rendering for high-throughput output; anything unsupported (no
   // WebGL context, exotic environment) falls back to the default renderer.
-  try {
-    const webgl = new WebglAddon();
-    webgl.onContextLoss(() => webgl.dispose());
-    terminal.loadAddon(webgl);
-  } catch {
-    /* keep the DOM/canvas renderer */
+  // The preview-only ?renderer=dom switch forces that fallback — headless
+  // screenshot harnesses paint DOM reliably where GPU surfaces may not.
+  if (document.documentElement.dataset.noWebgl !== "1") {
+    try {
+      const webgl = new WebglAddon();
+      webgl.onContextLoss(() => webgl.dispose());
+      terminal.loadAddon(webgl);
+    } catch {
+      /* keep the DOM/canvas renderer */
+    }
   }
 
   // Absolute positioning for the search bar needs a positioned ancestor.

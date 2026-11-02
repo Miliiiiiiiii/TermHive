@@ -71,14 +71,17 @@ func (transfer *Transfer) Written() int64 {
 // connection, all PTY sessions multiplex over it), specs keeps the dial
 // recipe mirrored to disk so reconnects survive sidecar restarts.
 type Manager struct {
-	mutex     sync.Mutex
-	shells    map[string]*Shell
-	conns     map[string]*Conn
-	transfers map[string]*Transfer
-	specs     map[string]ConnSpec
-	settings  map[string]any
-	dataDir   string
-	hostKeys  *HostKeyStore
+	mutex      sync.Mutex
+	shells     map[string]*Shell
+	conns      map[string]*Conn
+	transfers  map[string]*Transfer
+	tailTasks  map[string]*tailTask
+	followers  map[string]*logFollower
+	reconnects map[string]chan struct{}
+	specs      map[string]ConnSpec
+	settings   map[string]any
+	dataDir    string
+	hostKeys   *HostKeyStore
 
 	diagMutex sync.Mutex
 
@@ -88,12 +91,15 @@ type Manager struct {
 
 func NewManager(dataDir string) *Manager {
 	manager := &Manager{
-		shells:    map[string]*Shell{},
-		conns:     map[string]*Conn{},
-		transfers: map[string]*Transfer{},
-		specs:     map[string]ConnSpec{},
-		dataDir:   dataDir,
-		hostKeys:  NewHostKeyStore(dataDir),
+		shells:     map[string]*Shell{},
+		conns:      map[string]*Conn{},
+		transfers:  map[string]*Transfer{},
+		tailTasks:  map[string]*tailTask{},
+		followers:  map[string]*logFollower{},
+		reconnects: map[string]chan struct{}{},
+		specs:      map[string]ConnSpec{},
+		dataDir:    dataDir,
+		hostKeys:   NewHostKeyStore(dataDir),
 	}
 	if dataDir != "" {
 		_ = os.MkdirAll(dataDir, 0o700)

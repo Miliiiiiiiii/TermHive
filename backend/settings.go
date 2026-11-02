@@ -38,21 +38,38 @@ func (manager *Manager) GetSettings() map[string]any {
 	return manager.settings
 }
 
-// SetSettings replaces the whole blob, persists it atomically and broadcasts
-// settings.changed so every open surface (other connection tabs, the mini
-// window, the launcher home) re-applies live: the config is plugin-wide, not
-// per-session.
-func (manager *Manager) SetSettings(settings map[string]any) {
+// SetSettings merges a patch into the stored blob (a null value deletes the
+// key), persists the result atomically and broadcasts settings.changed so
+// every open surface (other connection tabs, the mini window, the launcher
+// home) re-applies live: the config is plugin-wide, not per-session. Merge —
+// not replace — because different UI surfaces own different keys (style keys
+// vs behavior toggles like autoReconnect/sessionLog); a replace here would
+// let each surface's save silently wipe the others' settings.
+func (manager *Manager) SetSettings(patch map[string]any) {
 	manager.mutex.Lock()
-	manager.settings = settings
+	merged := make(map[string]any, len(manager.settings)+len(patch))
+	for key, value := range manager.settings {
+		merged[key] = value
+	}
+	for key, value := range patch {
+		if value == nil {
+			delete(merged, key)
+		} else {
+			merged[key] = value
+		}
+	}
+	manager.settings = merged
 	manager.mutex.Unlock()
 	if manager.dataDir != "" {
-		if raw, err := json.MarshalIndent(settings, "", "  "); err == nil {
+		if raw, err := json.MarshalIndent(merged, "", "  "); err == nil {
 			temp := manager.settingsPath() + ".tmp"
 			if os.WriteFile(temp, raw, 0o600) == nil {
 				_ = os.Rename(temp, manager.settingsPath())
 			}
 		}
 	}
-	manager.emit("settings.changed", map[string]any{"settings": settings})
+	manager.emit("settings.changed", map[string]any{"settings": merged})
+	// behavior keys the backend itself reacts to (session-log sinks attach
+	// or detach on live shells)
+	manager.applySessionLogSetting()
 }

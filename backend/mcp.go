@@ -838,6 +838,44 @@ var mcpCatalog = []*mcpTool{
 		Required: []string{"from", "to"},
 		Handler:  mcpSftpRename,
 	},
+	{
+		Name:     "tail_start",
+		ReadOnly: true,
+		Description: "Follow a remote log in the background and poll it: starts `tail -F <path>` (survives rotation) or " +
+			"`journalctl -u <unit> -f` on the open SSH connection and returns a taskId at once. The command is assembled " +
+			"server-side from a validated path/unit — never a raw command. Poll with tail_read every few seconds (it returns " +
+			"immediately), finish with tail_stop; unread output is buffered (oldest bytes dropped past 256 KiB) and unused " +
+			"tasks reclaim after ~2 minutes. The follow runs until stopped, the connection closes or the stream dies.",
+		Properties: map[string]any{
+			"path":  map[string]any{"type": "string", "description": "Log file to follow (POSIX servers only)"},
+			"unit":  map[string]any{"type": "string", "description": "systemd unit to follow via journalctl -u (mutually exclusive with path)"},
+			"lines": map[string]any{"type": "integer", "description": "Initial trailing lines to include (default 100, max 10000)"},
+		},
+		Handler: mcpTailStart,
+	},
+	{
+		Name:     "tail_read",
+		ReadOnly: true,
+		Description: "Drain the new output of one follow task started by tail_start on the open connection. Returns at once: " +
+			"the bytes since your last read (maxBytes caps one call — default 32 KiB, max 128 KiB; poll again for more), a " +
+			"skipped count if the buffer cap dropped older output, and the stream's alive/ended state with its exit reason.",
+		Properties: map[string]any{
+			"taskId":   map[string]any{"type": "string", "description": "taskId returned by tail_start"},
+			"maxBytes": map[string]any{"type": "integer", "description": "Bytes to return per call (1..131072, default 32768)"},
+		},
+		Required: []string{"taskId"},
+		Handler:  mcpTailRead,
+	},
+	{
+		Name:     "tail_stop",
+		ReadOnly: true,
+		Description: "Stop one follow task of the open connection and free its slot (each connection holds at most 2 live tasks).",
+		Properties: map[string]any{
+			"taskId": map[string]any{"type": "string", "description": "taskId returned by tail_start"},
+		},
+		Required: []string{"taskId"},
+		Handler:  mcpTailStop,
+	},
 }
 
 func strDefault(values map[string]any, key, fallback string) string {

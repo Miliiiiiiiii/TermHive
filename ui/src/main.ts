@@ -40,8 +40,9 @@ async function main(): Promise<void> {
   // Host-free preview (static server): spin up a mock bridge so every view
   // stays usable while iterating on the UI outside DBX.
   if (typeof window.dbxPlugin === "undefined") {
-    const view = new URLSearchParams(location.search).get("view");
-    const context = view
+    const params = new URLSearchParams(location.search);
+    const view = params.get("view");
+    const context: Record<string, unknown> = view
       ? {
           view,
           shellId: view === "mini" ? "sh-demo" : undefined,
@@ -49,7 +50,27 @@ async function main(): Promise<void> {
           name: "demo-web-01",
         }
       : {};
+    // preview deep links (screenshot refresh, quick state inspection):
+    // ?files=1 opens the file panel with the session; ?follow=1 additionally
+    // starts the log viewer on the demo app.log once its row renders;
+    // ?renderer=dom forces xterm's DOM renderer (headless screenshot hosts)
+    if (params.get("files") === "1") context.openFiles = true;
+    if (params.get("renderer") === "dom") document.documentElement.dataset.noWebgl = "1";
     installMockBridge(context);
+    if (params.get("follow") === "1") {
+      // poll until the demo listing renders (first paint can outrun the
+      // mock's async fs/list), then start the log viewer on app.log
+      const deepLink = window.setInterval(() => {
+        const row = Array.from(document.querySelectorAll<HTMLTableRowElement>(".fp-table tbody tr")).find((r) =>
+          r.textContent?.includes("app.log"),
+        );
+        if (row) {
+          window.clearInterval(deepLink);
+          row.querySelector<HTMLButtonElement>('button[title*="tail -f"]')?.click();
+        }
+      }, 300);
+      window.setTimeout(() => window.clearInterval(deepLink), 8000);
+    }
   }
   const plugin = bridge();
   await plugin.ready;

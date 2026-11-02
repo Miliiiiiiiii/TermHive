@@ -10,3 +10,4 @@ tools/ptyserver/pty-modes.json
 .dbx-repository-signing-key.env
 .DS_Store
 *.log
+.zcode/

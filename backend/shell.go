@@ -64,6 +64,16 @@ type Shell struct {
 	closeMutex  sync.Mutex
 	closeReason string
 
+	// onClosed fires once when this shell ends, set before the pumps start
+	// (the auto-reconnect supervisor listens for transport death here; a shell
+	// EOF usually notices a dead link long before the keepalive does).
+	onClosed func(*Shell)
+
+	// logSink mirrors the flush-closure stream to disk when session logging
+	// is on; swapped live by the settings toggle. Atomic so the pumps never
+	// read a half-attached sink.
+	logSink atomic.Pointer[sessionLogSink]
+
 	writeErr atomic.Value // error
 }
 
@@ -222,12 +232,20 @@ func (shell *Shell) suppressChunk(chunk []byte) (emit []byte, done bool) {
 
 func (shell *Shell) markClosed(reason string) {
 	shell.closeMutex.Lock()
+	var callback func(*Shell)
 	if !shell.closed.Load() {
 		shell.closed.Store(true)
 		shell.closeReason = reason
 		close(shell.writeCh)
+		callback = shell.onClosed
 	}
 	shell.closeMutex.Unlock()
+	if callback != nil {
+		go callback(shell) // never block a pump on the supervisor
+	}
+	if sink := shell.logSink.Swap(nil); sink != nil {
+		_ = sink.Close() // flush the session log's tail
+	}
 }
 
 func (shell *Shell) Close(reason string) {
@@ -331,7 +349,10 @@ func sshClientConfig(spec ConnSpec, timeout time.Duration, interactive bool, hos
 // of an established connection. All sessions of one connection share the
 // single TCP/SSH channel, so closing one session never disturbs the others —
 // which dialing a fresh TCP connection per session could not guarantee.
-func ConnectShell(shared *ssh.Client, config ConnSpec, cols, rows int, emitter *dbxpluginsdk.Emitter) (*Shell, error) {
+// onClosed (optional) fires exactly once when the session ends, from its own
+// goroutine, set here BEFORE the pumps start so even an immediate EOF cannot
+// slip past it.
+func ConnectShell(shared *ssh.Client, config ConnSpec, cols, rows int, emitter *dbxpluginsdk.Emitter, onClosed func(*Shell)) (*Shell, error) {
 	if cols <= 0 {
 		cols = 80
 	}
@@ -362,6 +383,7 @@ func ConnectShell(shared *ssh.Client, config ConnSpec, cols, rows int, emitter *
 		emitter:   emitter,
 		session:   session,
 		writeCh:   make(chan []byte, 64),
+		onClosed:  onClosed,
 	}
 
 	stdout, err := session.StdoutPipe()
@@ -456,6 +478,11 @@ func (shell *Shell) pumpOutput(source io.Reader) {
 		}
 		shell.ring.Write(chunk)
 		shell.ringMutex.Unlock()
+		// session log: same post-suppress stream as ring and host; replay
+		// bypasses flush, so reconnects never double-log
+		if sink := shell.logSink.Load(); sink != nil {
+			_, _ = sink.Write(chunk)
+		}
 		if shell.emitter != nil {
 			_ = shell.emitter.Binary("term/"+shell.ID, chunk)
 		}

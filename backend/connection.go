@@ -237,6 +237,11 @@ func (manager *Manager) DisconnectConnection(request LifecycleRequest) {
 	for _, id := range shellIDs {
 		manager.CloseShell(id)
 	}
+	// AI follow tasks, log followers and any auto-reconnect attempt must not
+	// survive the disconnect either.
+	manager.stopTailTasksForConn(connectionID)
+	manager.stopFollowersForConn(connectionID)
+	manager.stopReconnectSupervisor(connectionID)
 	if conn != nil {
 		conn.Close()
 	}
@@ -373,6 +378,7 @@ func (manager *Manager) conn(connectionID string, emitter *dbxpluginsdk.Emitter,
 	if err != nil {
 		return nil, err
 	}
+	conn.onDead = func() { manager.notifyConnectionTrouble(connectionID) }
 	manager.mutex.Lock()
 	old := manager.conns[connectionID]
 	manager.conns[connectionID] = conn
@@ -383,15 +389,21 @@ func (manager *Manager) conn(connectionID string, emitter *dbxpluginsdk.Emitter,
 	return conn, nil
 }
 
-// dial opens one PTY session over the connection's shared client.
+// dial opens one PTY session over the connection's shared client. The shell
+// reports its own death to the reconnect supervisor — PTY EOF is usually the
+// first symptom of a dropped link.
 func (manager *Manager) dial(conn *Conn, cols, rows int, emitter *dbxpluginsdk.Emitter) (string, error) {
-	shell, err := ConnectShell(conn.Client(), conn.Spec, cols, rows, emitter)
+	onClosed := func(*Shell) { manager.notifyConnectionTrouble(conn.Spec.ConnectionID) }
+	shell, err := ConnectShell(conn.Client(), conn.Spec, cols, rows, emitter, onClosed)
 	if err != nil {
 		return "", err
 	}
 	manager.mutex.Lock()
 	manager.shells[shell.ID] = shell
 	manager.mutex.Unlock()
+	if manager.sessionLogEnabled() {
+		manager.attachSessionLog(shell)
+	}
 	manager.injectFollowHook(conn, shell)
 	return shell.ID, nil
 }

@@ -6,6 +6,9 @@ import { bridge, handleFileName, handleFileSize, hasFileTransfer, type FileHandl
 import { icon } from "./icon";
 import { t } from "./i18n";
 import { notify, confirmBox, promptBox } from "./notify";
+import { createTerminal } from "./term";
+import { Highlighter } from "./highlight";
+import { loadStyleSettings, onStyleSettingsChanged } from "./styleSettings";
 import {
   api,
   notify as rpcNotify,
@@ -240,6 +243,12 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
         edit.title = t("editFile");
         edit.addEventListener("click", () => void openEditor(joinRemote(cwd, entry.name)));
         actions.append(edit);
+        const follow = document.createElement("button");
+        follow.className = "icon-btn";
+        follow.innerHTML = icon("follow", 14);
+        follow.title = t("followLog");
+        follow.addEventListener("click", () => openLogView(joinRemote(cwd, entry.name)));
+        actions.append(follow);
       }
       const rename = document.createElement("button");
       rename.className = "icon-btn";
@@ -967,6 +976,129 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
     });
     document.querySelector("#app")!.append(overlay);
     void loadWindow(0);
+  }
+
+  // ---- log follow viewer (tail -f) ----
+  // One overlay, one xterm fed by the tail/<id> binary channel. An xterm
+  // (not a textarea) gets the coloring rules, Ctrl+F search and huge
+  // scrollback for free. Scroll lock: writing new output pins the view only
+  // while the user is AT the bottom; scrolling up pauses following and shows
+  // a "new output" pill, jumping back down resumes.
+  function openLogView(path: string): void {
+    const overlay = document.createElement("div");
+    overlay.className = "editor-overlay";
+    overlay.innerHTML = `
+      <div class="editor-card log-card">
+        <div class="editor-head">
+          <span class="editor-title"></span>
+          <span class="editor-status"></span>
+          <span class="spacer"></span>
+          <button class="btn small log-jump" data-act="jump" hidden>↓ 0</button>
+          <button class="btn ghost small" data-act="close">${t("editorClose")}</button>
+        </div>
+        <div class="log-body"></div>
+      </div>
+    `;
+    const title = overlay.querySelector<HTMLElement>(".editor-title")!;
+    const status = overlay.querySelector<HTMLElement>(".editor-status")!;
+    const body = overlay.querySelector<HTMLElement>(".log-body")!;
+    const jump = overlay.querySelector<HTMLButtonElement>('[data-act="jump"]')!;
+    title.textContent = path;
+
+    const highlighter = new Highlighter({ enabled: true });
+    const term = createTerminal(body);
+
+    let detachChannel: (() => void) | undefined;
+    let detachSettings: (() => void) | undefined;
+    let detachEvents: (() => void) | undefined;
+    let taskId = "";
+    let closed = false;
+    const close = (): void => {
+      if (closed) return;
+      closed = true;
+      if (taskId) rpcNotify("tail/stop", { taskId });
+      detachChannel?.();
+      detachSettings?.();
+      detachEvents?.();
+      term.dispose();
+      overlay.remove();
+    };
+    overlay.querySelector('[data-act="close"]')!.addEventListener("click", close);
+    overlay.addEventListener("pointerdown", (event) => {
+      if (event.target === overlay) close();
+    });
+
+    // live styling: apply current settings now and follow changes while open
+    void loadStyleSettings().then((settings) => {
+      highlighter.setEnabled(settings.highlight);
+      highlighter.setRules(settings.rules);
+      term.setScheme(settings.scheme);
+    });
+    detachSettings = onStyleSettingsChanged((settings) => {
+      highlighter.setEnabled(settings.highlight);
+      highlighter.setRules(settings.rules);
+      term.setScheme(settings.scheme);
+    });
+
+    // scroll lock on the xterm viewport
+    const viewport = body.querySelector<HTMLElement>(".xterm-viewport");
+    let atBottom = true;
+    let pendingLines = 0;
+    const refreshPill = (): void => {
+      jump.hidden = atBottom;
+      jump.textContent = `↓ ${pendingLines}`;
+    };
+    if (viewport) {
+      viewport.addEventListener("scroll", () => {
+        const bottom =
+          viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 8;
+        if (bottom && !atBottom) pendingLines = 0;
+        atBottom = bottom;
+        refreshPill();
+      });
+    }
+    jump.addEventListener("click", () => {
+      atBottom = true;
+      pendingLines = 0;
+      term.terminal.scrollToBottom();
+      refreshPill();
+    });
+
+    detachEvents = onSidecarEvent((message) => {
+      if (message.method !== "tail.done" || String(message.params.taskId || "") !== taskId) return;
+      status.textContent = `${t("followEnded")}: ${String(message.params.reason || "")}`;
+    });
+
+    document.querySelector("#app")!.append(overlay);
+    term.fit();
+    const fitObserver = new ResizeObserver(() => term.fit());
+    fitObserver.observe(body);
+
+    status.textContent = t("connecting");
+    void (async () => {
+      try {
+        const start = await api<{ taskId: string }>("tail/start", { shellId, path, lines: 200 }, 30000);
+        if (closed) return;
+        taskId = start.taskId;
+        // subscribe BEFORE ready: the follower emits nothing until tail/ready,
+        // so no byte can be dropped by the demux
+        detachChannel = onBinaryChannel(`tail/${taskId}`, (data) => {
+          const styled = highlighter.process(data);
+          term.write(styled);
+          if (atBottom) {
+            term.terminal.scrollToBottom();
+          } else {
+            for (const byte of styled) pendingLines += byte === 0x0a ? 1 : 0;
+            refreshPill();
+          }
+        });
+        rpcNotify("tail/ready", { taskId });
+        status.textContent = t("followLive");
+      } catch (error: any) {
+        notify(`${t("followLog")}: ${error.message}`);
+        close();
+      }
+    })();
   }
 
   return { root, followCwd };

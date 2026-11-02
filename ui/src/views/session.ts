@@ -193,6 +193,8 @@ export async function mountSession(context: SessionContext): Promise<() => void>
     styleState.scheme = next.scheme;
     styleState.highlight = next.highlight;
     styleState.rules = next.rules;
+    styleState.autoReconnect = next.autoReconnect;
+    styleState.sessionLog = next.sessionLog;
     applySchemeAll();
     applyHighlightSettings();
   }
@@ -200,14 +202,42 @@ export async function mountSession(context: SessionContext): Promise<() => void>
   const detachStyleEvent = onStyleSettingsChanged(syncStyle);
 
   const detachEvent = onSidecarEvent((message) => {
-    if (message.method !== "shell.closed") return;
-    const reason = String(message.params.reason || "");
-    const index = tabs.findIndex((tab) => tab.shellId === message.params.shellId);
-    if (index === -1) return;
-    if (index === activeIndex()) {
-      showClosed(reason);
-    } else {
-      removeTabAt(index);
+    if (message.method === "shell.closed") {
+      const reason = String(message.params.reason || "");
+      const index = tabs.findIndex((tab) => tab.shellId === message.params.shellId);
+      if (index === -1) return;
+      // The dead shell is a stale id from this tab's perspective: mark it so
+      // the next connect() rebinds this tab to a fresh shell instead of
+      // stacking an extra one.
+      attachFailed.add(String(message.params.shellId || ""));
+      if (index === activeIndex()) {
+        showClosed(reason);
+      } else {
+        removeTabAt(index);
+      }
+      return;
+    }
+    if (message.method === "connection.reconnecting") {
+      if (String(message.params.connectionId || "") !== connectionId || !closedNotified) return;
+      const attempt = Number(message.params.attempt || 0);
+      overlayTitle.textContent = t("reconnecting");
+      overlayReason.textContent = `${t("reconnectingWait")} · ${attempt}`;
+      statusDot.className = "dot busy";
+      overlay.hidden = false;
+      return;
+    }
+    if (message.method === "connection.reconnected") {
+      if (String(message.params.connectionId || "") !== connectionId || !closedNotified) return;
+      void connect();
+      return;
+    }
+    if (message.method === "connection.failed") {
+      if (String(message.params.connectionId || "") !== connectionId || !closedNotified) return;
+      statusDot.className = "dot dead";
+      overlayTitle.textContent = t("disconnected");
+      overlayReason.textContent = `${t("reconnectFailed")}: ${String(message.params.reason || "")}`;
+      overlay.hidden = false;
+      return;
     }
   });
 
@@ -893,9 +923,17 @@ export async function mountSession(context: SessionContext): Promise<() => void>
   function showClosed(reason: string): void {
     if (closedNotified) return;
     closedNotified = true;
-    statusDot.className = "dot dead";
-    overlayTitle.textContent = t("disconnected");
-    overlayReason.textContent = reason;
+    if (styleState.autoReconnect) {
+      // The backend supervisor is (about to be) retrying; show that state
+      // instead of a dead end — connection.reconnecting will refine the text.
+      statusDot.className = "dot busy";
+      overlayTitle.textContent = t("reconnecting");
+      overlayReason.textContent = `${reason}\n${t("reconnectingWait")}`;
+    } else {
+      statusDot.className = "dot dead";
+      overlayTitle.textContent = t("disconnected");
+      overlayReason.textContent = reason;
+    }
     overlay.hidden = false;
   }
 

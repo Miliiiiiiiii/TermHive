@@ -33,14 +33,22 @@
 
 ### AI 工具(MCP)
 
-- 9 个工具分三档对外授权:`read`(只读,零授权即暴露)/ `write`(SFTP 写)/ `full`(exec 任意命令),供 DBX 内置 AI 与外部 agent 使用
+- 12 个工具分三档对外授权:`read`(只读,零授权即暴露)/ `write`(SFTP 写)/ `full`(exec 任意命令),供 DBX 内置 AI 与外部 agent 使用
 - 安全分层:白名单命令分类器(禁重定向/命令替换、排除高危解释器)、灾难模式硬拒(`rm -rf /`、`mkfs`、fork 炸弹等)、写操作逐次弹窗批准、SFTP 路径护栏、命令超时与输出上限、调用进 diag.log 与 DBX 审计
 - 连接定位:每次调用按宿主附带的连接记录拨号,缓存连接校验目标主机,id 不精确匹配即拒绝——工作台与 MCP 桥各跑一个 sidecar 时也绝不把命令发到另一台服务器(rc.1 在此场景下会错路由)
 - 只读命令按远端 shell 家族词法判定(POSIX 认单引号与反斜杠转义,cmd/PowerShell/未知只认双引号):引号内的 |、>、< 是字面量,grep 的 `\|`、日志里的 `==>` 不再误拒;双引号内的 `$(` 与反引号仍拒绝;危险旗标(tail -f、find -delete)穿透引号包裹照拦(rc.2 会放行 `find x "-delete"`)
+- 只读日志跟随三件套 `tail_start` / `tail_read` / `tail_stop`(rc.4):后台跑 `tail -F <path>`(抗轮转)或 `journalctl -u <unit> -f`,轮询取新字节——命令由服务端固定拼装、绝不接受原始命令串,这是三件套免审批声明的根基;每连接 ≤2 个活跃任务、未读缓冲保尾部(超 256KiB 报告 skipped)、连接断开任务即亡、约 2 分钟无人读取自动回收、跨连接读取拒绝
+
+### 日志模式与自动重连(rc.4)
+
+- 文件面板对日志文件一键跟随(tail -f):SFTP 按路径轮询(不持句柄,天然免疫通道重建与 rename 轮转),新字节经 `tail/<id>` 二进制通道推送;查看器为 xterm 实例——与日志着色规则联动、Ctrl+F 搜索;滚动锁定(上翻暂停并浮现"新输出 N 行"胶囊、回底自动恢复);轮转/截断自动重置;GBK/GB18030 分字节 carry,多字节字符跨轮询不碎
+- 断线自动重连:双死亡信号(PTY EOF + keepalive 失败)唤醒监督者,探测确认后按指数退避 2s→60s 重拨;认证失败与主机指纹变更视为永久失败直接放弃;`connection.reconnecting/reconnected/failed` 事件驱动 UI 覆盖层显示进度并自动重绑标签;设置页可关(默认开)
+- 会话日志落盘:可选把终端输出按行加时间戳写入 `<dataDir>/logs/<user@host_port>/<时间>-<shellId>.log`(原始 ANSI 保留、单会话 64MiB 封顶);设置页开关实时对存活会话挂载/摘除
+- settings/put 改合并语义(null 删键):不同 UI 面板各管各的键,一次风格保存不再抹掉行为开关
 
 ### 设置与诊断
 
-- 插件设置页:配色主题(One Dark / Dracula / Solarized Dark / Nord / GitHub Light / 跟随 DBX)+ 日志着色规则(正则 + 7 色 + 整行/片段,完全自定义),插件级实时广播到所有已打开终端与浮窗
+- 插件设置页:配色主题(One Dark / Dracula / Solarized Dark / Nord / GitHub Light / 跟随 DBX)+ 日志着色规则(正则 + 7 色 + 整行/片段,完全自定义)+ 行为开关(断线自动重连、会话日志落盘),插件级实时广播到所有已打开终端与浮窗
 - 飞行记录仪:全量 UI↔后端调用写 diag.log(自动脱敏、封顶 128KiB)
 
 ### 工程

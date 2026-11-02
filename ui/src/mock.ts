@@ -165,6 +165,24 @@ export function installMockBridge(context: Record<string, unknown>): void {
           return { transferId: "t-demo-" + ++counter };
         case "transfer/startDownload":
           return { transferId: "t-demo-" + ++counter, size: 1024 };
+        case "tail/start":
+          return { taskId: "fw-demo" };
+        case "tail/ready":
+          // a taste of live follow in preview mode: a burst of demo lines,
+          // including an ERROR one so the coloring rules show up
+          setTimeout(() => {
+            push("tail/fw-demo", "[demo] service started, following app.log\r\n");
+            let tick = 0;
+            const timer = window.setInterval(() => {
+              tick += 1;
+              push("tail/fw-demo", `2026-11-02 12:00:${String(tick % 60).padStart(2, "0")} INFO  request served in ${tick * 3}ms\r\n`);
+              if (tick === 3) push("tail/fw-demo", "2026-11-02 12:00:03 ERROR demo failure line for the coloring rules\r\n");
+              if (tick >= 8) window.clearInterval(timer);
+            }, 900);
+          }, 250);
+          return { ok: true };
+        case "tail/stop":
+          return { ok: true };
         default:
           throw new Error(`mock: ${method} not implemented`);
       }
@@ -173,7 +191,11 @@ export function installMockBridge(context: Record<string, unknown>): void {
       if (method === "host.getContext") return context;
       throw new Error(`mock request: ${method}`);
     },
-    notify: async () => null,
+    notify: async (method: string, params: any = {}) => {
+      // the preview follow demo rides on the tail/ready notification
+      if (method === "tail/ready") return mock.invoke(method, params);
+      return null;
+    },
     sendBinary: async (channel: string, data: Uint8Array | string) => {
       const [prefix] = channel.split("/");
       if (prefix === "term") {
