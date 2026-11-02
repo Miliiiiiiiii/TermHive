@@ -117,7 +117,8 @@ func (manager *Manager) MCPCall(values map[string]any, emitter *dbxpluginsdk.Emi
 	if arguments == nil {
 		arguments = map[string]any{}
 	}
-	conn, err := manager.mcpConnection(arguments, emitter)
+	lifecycle, _ := values["lifecycle"].(map[string]any)
+	conn, err := manager.mcpConnection(arguments, lifecycle, emitter)
 	if err != nil {
 		return mcpTextResult(err.Error(), true), nil
 	}
@@ -135,12 +136,19 @@ func mcpTextResult(text string, isErr bool) map[string]any {
 	}
 }
 
-// mcpConnection resolves which connection a tool call targets: the
-// host-injected connectionId first, then the dbx_connection name the model
-// picked, then the only live connection. Resolution redials from the cached
-// spec when the shared client dropped — the same recovery a workbench tab
-// gets after a sidecar restart.
-func (manager *Manager) mcpConnection(arguments map[string]any, emitter *dbxpluginsdk.Emitter) (*Conn, error) {
+// mcpConnection resolves which connection a tool call targets. The host
+// binds each call to one connection: it injects the record id as
+// connectionId and attaches the full record as lifecycle — the payload
+// connection/connect gets. That spec is the authority on which server the
+// id means and is dialed from directly: the MCP bridge runs its own sidecar
+// of this plugin, whose spec cache can predate the connection, and a cache
+// lookup that guessed (findSpec's single-spec fallback) would run the
+// command on whichever server this sidecar happened to know. Without a
+// lifecycle (older hosts) the id must match the cache exactly. Either way
+// the shared client is redialed when it dropped — the same recovery a
+// workbench tab gets after a sidecar restart.
+func (manager *Manager) mcpConnection(arguments, lifecycle map[string]any, emitter *dbxpluginsdk.Emitter) (*Conn, error) {
+	known, haveKnown := manager.lifecycleSpec(lifecycle)
 	var candidates []string
 	if id := str(arguments["connectionId"]); id != "" {
 		candidates = append(candidates, id)
@@ -149,20 +157,58 @@ func (manager *Manager) mcpConnection(arguments map[string]any, emitter *dbxplug
 		candidates = append(candidates, manager.connectionIdByName(named)...)
 		candidates = append(candidates, named)
 	}
+	if len(candidates) == 0 && haveKnown {
+		candidates = append(candidates, known.ConnectionID)
+	}
 	if len(candidates) == 0 {
 		if single := manager.singleLiveConnection(); single != "" {
 			candidates = append(candidates, single)
 		}
 	}
+	var lastErr error
 	for _, id := range candidates {
 		if id == "" {
 			continue
 		}
-		if conn, err := manager.conn(id, emitter); err == nil {
+		var conn *Conn
+		var err error
+		if haveKnown && id == known.ConnectionID {
+			conn, err = manager.conn(id, emitter, known)
+		} else {
+			conn, err = manager.connExact(id, emitter)
+		}
+		if err == nil {
 			return conn, nil
 		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		return nil, lastErr
 	}
 	return nil, errors.New("no open TermHive connection: open the SSH connection in DBX first")
+}
+
+// lifecycleSpec is the dial recipe the host attached to an mcp/call, with
+// credentials the host left out filled from the cached spec of the same
+// server (the workbench's sidecar stored them on connect).
+func (manager *Manager) lifecycleSpec(lifecycle map[string]any) (ConnSpec, bool) {
+	if lifecycle == nil {
+		return ConnSpec{}, false
+	}
+	request, err := parseLifecycle(lifecycle)
+	if err != nil {
+		return ConnSpec{}, false
+	}
+	spec, err := request.spec()
+	if err != nil {
+		return ConnSpec{}, false
+	}
+	if spec.Auth.Password == "" && spec.Auth.KeyPath == "" {
+		if cached, ok := manager.cachedSpec(spec.ConnectionID); ok && sameEndpoint(cached, spec) {
+			spec.Auth = cached.Auth
+		}
+	}
+	return spec, true
 }
 
 func (manager *Manager) connectionIdByName(named string) []string {

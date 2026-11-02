@@ -108,30 +108,59 @@ func (manager *Manager) specsPath() string {
 }
 
 func (manager *Manager) loadSpecs() {
+	specs, legacy, ok := manager.readSpecsFile()
+	if !ok {
+		return
+	}
+	manager.specs = specs
+	if legacy {
+		// Legacy plaintext (pre-0.4.5): seal it immediately.
+		manager.persistSpecs()
+	}
+}
+
+// readSpecsFile parses the on-disk credential cache without touching the
+// in-memory map; legacy reports a pre-0.4.5 plaintext file. Current format
+// is a sealed envelope. Sealed but undecryptable (data dir moved to another
+// machine or Windows account) reads as absent while the file is kept for
+// forensics — reconnecting rebuilds the cache.
+func (manager *Manager) readSpecsFile() (specs map[string]ConnSpec, legacy, ok bool) {
 	raw, err := os.ReadFile(manager.specsPath())
 	if err != nil {
-		return
+		return nil, false, false
 	}
-	// Current format: sealed envelope. Sealed but undecryptable (data dir
-	// moved to another machine or Windows account) starts empty while the
-	// file is kept for forensics — reconnecting rebuilds the cache.
-	if plaintext, openErr := manager.openSpecs(raw); openErr == nil {
-		var specs map[string]ConnSpec
-		if json.Unmarshal(plaintext, &specs) == nil && specs != nil {
-			manager.specs = specs
-		} else {
+	plaintext, openErr := manager.openSpecs(raw)
+	switch {
+	case openErr == nil:
+	case errors.Is(openErr, errNotSealed):
+		plaintext, legacy = raw, true
+	default:
+		manager.writeDiag("specs.json 解密失败(" + openErr.Error() + "), 已忽略; 重新连接后会重建凭据缓存")
+		return nil, false, false
+	}
+	if json.Unmarshal(plaintext, &specs) != nil || specs == nil {
+		if !legacy {
 			manager.writeDiag("specs.json 解密成功但内容不可解析, 已忽略")
 		}
-		return
-	} else if !errors.Is(openErr, errNotSealed) {
-		manager.writeDiag("specs.json 解密失败(" + openErr.Error() + "), 已忽略; 重新连接后会重建凭据缓存")
+		return nil, false, false
+	}
+	return specs, legacy, true
+}
+
+// mergeSpecsFromDisk folds the on-disk cache into memory. The workbench and
+// the MCP bridge each run their own sidecar of this plugin, and a connection
+// opened in one is flushed to disk for the other to pick up: disk wins on
+// the same id (written by whichever sidecar connected last), entries only
+// this sidecar knows are kept. Nothing is written back.
+func (manager *Manager) mergeSpecsFromDisk() {
+	specs, _, ok := manager.readSpecsFile()
+	if !ok {
 		return
 	}
-	// Legacy plaintext (pre-0.4.5): hydrate, then seal it immediately.
-	var specs map[string]ConnSpec
-	if json.Unmarshal(raw, &specs) == nil && specs != nil {
-		manager.specs = specs
-		manager.persistSpecs()
+	manager.mutex.Lock()
+	defer manager.mutex.Unlock()
+	for id, spec := range specs {
+		manager.specs[id] = spec
 	}
 }
 

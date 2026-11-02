@@ -261,6 +261,36 @@ func (manager *Manager) findSpec(connectionID string) (ConnSpec, bool) {
 	return ConnSpec{}, false
 }
 
+// cachedSpec is the spec cached for exactly this id, refreshing from disk
+// on a miss: the workbench's sidecar may have connected the id after this
+// sidecar loaded the cache (see mergeSpecsFromDisk).
+func (manager *Manager) cachedSpec(connectionID string) (ConnSpec, bool) {
+	manager.mutex.Lock()
+	spec, ok := manager.specs[connectionID]
+	manager.mutex.Unlock()
+	if ok {
+		return spec, true
+	}
+	manager.mergeSpecsFromDisk()
+	manager.mutex.Lock()
+	defer manager.mutex.Unlock()
+	spec, ok = manager.specs[connectionID]
+	return spec, ok
+}
+
+// connExact is conn for callers that hold nothing but an id: it must be
+// cached exactly. findSpec's single-spec fallback is deliberately skipped —
+// it serves the workbench reconnect path (host reissued the record id) and
+// would otherwise answer with whichever one server this sidecar knows,
+// running the caller's command on the wrong host.
+func (manager *Manager) connExact(connectionID string, emitter *dbxpluginsdk.Emitter) (*Conn, error) {
+	spec, ok := manager.cachedSpec(connectionID)
+	if !ok {
+		return nil, errors.New("连接尚未建立: 请在左侧连接列表断开后重新双击该连接")
+	}
+	return manager.conn(connectionID, emitter, spec)
+}
+
 // EnsureConnection is the workbench entry point: it returns a live PTY of
 // the connection, opening one over the shared client when the sidecar has
 // none — e.g. the tab outlived a network drop or the backend was restarted.
@@ -320,7 +350,14 @@ func (manager *Manager) conn(connectionID string, emitter *dbxpluginsdk.Emitter,
 	cached := manager.conns[connectionID]
 	manager.mutex.Unlock()
 	if cached != nil && !cached.Dead() {
-		return cached, nil
+		if len(known) == 0 || sameEndpoint(cached.Spec, known[0]) {
+			return cached, nil
+		}
+		// The live client points at another server than the spec the caller
+		// holds — a cross-wired entry; replace it below rather than hand it out.
+		manager.writeDiag(fmt.Sprintf("conn %s: cached client is %s@%s:%d but the spec says %s@%s:%d, redialing",
+			connectionID, cached.Spec.Username, cached.Spec.Host, cached.Spec.Port,
+			known[0].Username, known[0].Host, known[0].Port))
 	}
 	var spec ConnSpec
 	var ok bool

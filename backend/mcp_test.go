@@ -186,3 +186,77 @@ func TestCappedWriterFinishCombinesMarkers(t *testing.T) {
 		t.Errorf("unexpected combined finish: %q", text)
 	}
 }
+
+// The MCP bridge runs its own sidecar of this plugin, whose spec cache can
+// predate the connection the host binds a call to. Resolution must then
+// dial the server the host named in the lifecycle payload — and with no
+// lifecycle at all, refuse — never answer with the one server the cache
+// happens to hold (that ran commands on the wrong host).
+func TestMcpConnectionNeverGuessesAnotherServer(t *testing.T) {
+	manager := NewManager(t.TempDir())
+	manager.specs["conn-a"] = ConnSpec{ConnectionID: "conn-a", Host: "127.0.0.1", Port: 22, Username: "gordo",
+		Auth: AuthConfig{Method: "password", Password: "x"}}
+
+	_, err := manager.mcpConnection(map[string]any{"connectionId": "conn-b"}, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "连接尚未建立") {
+		t.Fatalf("unknown id without lifecycle must be refused, got %v", err)
+	}
+
+	// port 1 refuses at once; what matters is that the dial targeted it
+	lifecycle := map[string]any{"connection": map[string]any{
+		"id": "conn-b", "host": "127.0.0.1", "port": float64(1), "username": "root", "password": "p",
+	}}
+	_, err = manager.mcpConnection(map[string]any{"connectionId": "conn-b"}, lifecycle, nil)
+	if err == nil {
+		t.Fatal("dial to 127.0.0.1:1 unexpectedly succeeded")
+	}
+	if strings.Contains(err.Error(), "连接尚未建立") {
+		t.Fatalf("lifecycle spec was not dialed: %v", err)
+	}
+	if _, cross := manager.conns["conn-b"]; cross {
+		t.Fatal("a failed dial must not leave a cached client behind")
+	}
+}
+
+// A cached client pointing at another server than the spec the caller holds
+// (the cross-wired entry the old fallback could create) is never handed out;
+// a matching spec still hits the cache.
+func TestConnRejectsCrossWiredCache(t *testing.T) {
+	manager := NewManager(t.TempDir())
+	stale := &Conn{Spec: ConnSpec{ConnectionID: "conn-b", Host: "127.0.0.1", Port: 22, Username: "gordo"}}
+	manager.conns["conn-b"] = stale
+	want := ConnSpec{ConnectionID: "conn-b", Host: "127.0.0.1", Port: 1, Username: "root",
+		Auth: AuthConfig{Method: "password", Password: "p"}}
+	conn, err := manager.conn("conn-b", nil, want)
+	if conn == stale {
+		t.Fatal("stale cross-wired client handed out")
+	}
+	if err == nil {
+		t.Fatalf("expected the redial to 127.0.0.1:1 to fail, got %s:%d", conn.Spec.Host, conn.Spec.Port)
+	}
+	if same, _ := manager.conn("conn-b", nil, stale.Spec); same != stale {
+		t.Fatal("a matching spec must still hit the cache")
+	}
+}
+
+// A sidecar that loaded the cache before another sidecar connected a new
+// server picks that server up from disk on the exact-id miss.
+func TestCachedSpecRefreshesFromDisk(t *testing.T) {
+	dir := t.TempDir()
+	writer := NewManager(dir)
+	writer.mutex.Lock()
+	writer.specs["conn-new"] = ConnSpec{ConnectionID: "conn-new", Host: "10.0.0.9", Port: 22, Username: "root",
+		Auth: AuthConfig{Method: "password", Password: "s"}}
+	writer.persistSpecsLocked()
+	writer.mutex.Unlock()
+
+	reader := NewManager(dir)
+	reader.specs = map[string]ConnSpec{"conn-old": {ConnectionID: "conn-old", Host: "127.0.0.1", Port: 22, Username: "gordo"}}
+	spec, ok := reader.cachedSpec("conn-new")
+	if !ok || spec.Host != "10.0.0.9" || spec.Auth.Password != "s" {
+		t.Fatalf("spec not refreshed from disk: ok=%v spec=%+v", ok, spec)
+	}
+	if _, kept := reader.specs["conn-old"]; !kept {
+		t.Fatal("merge must keep entries only this sidecar knows")
+	}
+}
