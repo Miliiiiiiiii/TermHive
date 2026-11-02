@@ -4,7 +4,7 @@
 [![Release](https://github.com/Miliiiiiiiii/TermHive/actions/workflows/plugin-release.yml/badge.svg)](https://github.com/Miliiiiiiiii/TermHive/actions/workflows/plugin-release.yml)
 [![Version](https://img.shields.io/github/v/release/Miliiiiiiiii/TermHive?include_prereleases)](https://github.com/Miliiiiiiiii/TermHive/releases)
 
-DBX 插件：SSH 终端 + SFTP 文件管理，用来替代 Xshell / Xftp。连接保存在 DBX 原生连接列表里，双击连接即在 DBX 标签页内打开终端与文件面板。插件 id 为 `com.milii.termhive`（发布者 milii）。
+DBX 插件：SSH 终端 + SFTP 文件管理。连接保存在 DBX 原生连接列表里，双击连接即在 DBX 标签页内打开终端与文件面板。插件 id 为 `com.milii.termhive`（发布者 milii）。
 
 ## 截图
 
@@ -93,7 +93,7 @@ dbx-plugin package .                                        # 产出 dist/*.dbxp
 
 ## English
 
-TermHive is a DBX plugin that replaces Xshell/Xftp: an SSH terminal and an SFTP file panel living natively in DBX tabs. Connections are stored in DBX's own connection list — double-click one and the terminal plus file panel open inside a DBX workbench.
+TermHive is a DBX plugin: an SSH terminal and an SFTP file panel living natively in DBX tabs. Connections are stored in DBX's own connection list — double-click one and the terminal plus file panel open inside a DBX workbench.
 
 Highlights:
 
