@@ -260,7 +260,7 @@ func (ctx *mcpContext) exec(command string, timeout time.Duration, cap int) (str
 
 func mcpExecReadonly(ctx *mcpContext, args map[string]any) (string, error) {
 	command := str(args["command"])
-	if err := isReadOnlyCommand(command); err != nil {
+	if err := isReadOnlyCommandFor(command, ctx.conn.detectShellKind()); err != nil {
 		return "", fmt.Errorf("not a read-only command (%v); use the exec tool, which requires user approval", err)
 	}
 	return ctx.exec(command, mcpExecReadonlyTimeout, mcpReadOnlyOutputCap)
@@ -404,12 +404,16 @@ var readOnlyFlagDenylist = map[string][]string{
 	"journalctl": {"--vacuum", "--rotate", "--flush"},
 }
 
-// isReadOnlyCommand decides whether the whole command line may run without
-// per-call approval. Strict by design: whitelisted programs only, no
-// redirection, no substitution, no command chaining into unknown territory.
-// Anything rejected here can still run through the exec tool, which the host
-// gates behind explicit user approval.
-func isReadOnlyCommand(command string) error {
+// isReadOnlyCommandFor decides whether the whole command line may run without
+// per-call approval on a server whose login shell is kind. Strict by design:
+// whitelisted programs only, no redirection, no substitution, no command
+// chaining into unknown territory — judged on the words the shell would
+// hand to each program (quoting modeled per shell family by
+// scanShellCommand), so `grep "a\|b"` is the literal pattern it is while
+// `find x "-delete"` is still the delete it is. Anything rejected here can
+// still run through the exec tool, which the host gates behind explicit
+// user approval.
+func isReadOnlyCommandFor(command string, kind shellKind) error {
 	command = strings.TrimSpace(command)
 	if command == "" {
 		return errors.New("empty command")
@@ -417,28 +421,29 @@ func isReadOnlyCommand(command string) error {
 	if len(command) > mcpMaxCommandLength {
 		return errors.New("command too long")
 	}
-	for _, marker := range []string{"`", "$(", "<", ">"} {
-		if strings.Contains(command, marker) {
-			return fmt.Errorf("%q is not allowed in read-only commands", marker)
-		}
+	segments, err := scanShellCommand(command, kind)
+	if err != nil {
+		return err
 	}
-	normalized := strings.ReplaceAll(strings.ReplaceAll(command, "&&", ";"), "||", ";")
-	for _, segment := range strings.FieldsFunc(normalized, func(r rune) bool {
-		return r == ';' || r == '|' || r == '\n'
-	}) {
-		if err := classifyReadOnlySegment(segment); err != nil {
+	for _, words := range segments {
+		if err := classifyReadOnlyWords(words); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func classifyReadOnlySegment(segment string) error {
-	fields := strings.Fields(segment)
-	if len(fields) == 0 {
+// isReadOnlyCommand is isReadOnlyCommandFor with the shell unknown: only
+// double quotes protect, which is the rule set every supported shell agrees on.
+func isReadOnlyCommand(command string) error {
+	return isReadOnlyCommandFor(command, kindUnknown)
+}
+
+func classifyReadOnlyWords(words []string) error {
+	if len(words) == 0 {
 		return nil
 	}
-	program := fields[0]
+	program := words[0]
 	if index := strings.LastIndexAny(program, "/\\"); index >= 0 {
 		program = program[index+1:]
 	}
@@ -449,10 +454,10 @@ func classifyReadOnlySegment(segment string) error {
 	case anyArgs:
 	case subGated:
 		index := 1
-		for index < len(fields) && strings.HasPrefix(fields[index], "-") {
+		for index < len(words) && strings.HasPrefix(words[index], "-") {
 			index++
 		}
-		if index >= len(fields) || !subs[fields[index]] {
+		if index >= len(words) || !subs[words[index]] {
 			return fmt.Errorf("%s is only read-only with subcommands like status/show/list", program)
 		}
 	case flagGated:
@@ -460,9 +465,9 @@ func classifyReadOnlySegment(segment string) error {
 		return fmt.Errorf("%q is not on the read-only allowlist", program)
 	}
 	for _, flag := range denied {
-		for _, field := range fields {
-			if strings.HasPrefix(strings.ToLower(field), flag) {
-				return fmt.Errorf("%s %s would not be read-only", program, field)
+		for _, word := range words {
+			if strings.HasPrefix(strings.ToLower(word), flag) {
+				return fmt.Errorf("%s %s would not be read-only", program, word)
 			}
 		}
 	}
@@ -739,7 +744,8 @@ var mcpCatalog = []*mcpTool{
 		ReadOnly: true,
 		Description: "Run a read-only shell command on the open SSH connection: whitelisted programs only " +
 			"(ls, cat, head, tail, grep, find, df, du, ps, free, ss, ip addr, systemctl status, journalctl, git log, docker ps, dir …) " +
-			"with no redirection or substitution. Runs without per-call approval; anything not clearly read-only is rejected — use exec for that.",
+			"with no unquoted redirection or substitution (quoted |, >, < are fine, e.g. grep \"a\\|b\"). " +
+			"Runs without per-call approval; anything not clearly read-only is rejected — use exec for that.",
 		Properties: map[string]any{
 			"command": map[string]any{"type": "string", "description": "The command line to run"},
 		},
