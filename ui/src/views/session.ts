@@ -190,11 +190,7 @@ export async function mountSession(context: SessionContext): Promise<() => void>
     for (const tab of tabs) tab.term?.setScheme(styleState.scheme);
   }
   function syncStyle(next: StyleSettings): void {
-    styleState.scheme = next.scheme;
-    styleState.highlight = next.highlight;
-    styleState.rules = next.rules;
-    styleState.autoReconnect = next.autoReconnect;
-    styleState.sessionLog = next.sessionLog;
+    Object.assign(styleState, next);
     applySchemeAll();
     applyHighlightSettings();
   }

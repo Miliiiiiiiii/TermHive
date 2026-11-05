@@ -33,6 +33,7 @@ interface QueueItem {
   row: HTMLElement;
   bar: HTMLElement;
   label: HTMLElement;
+  autoCloseScheduled?: boolean;
 }
 
 const UPLOAD_CHUNK = 256 * 1024;
@@ -81,6 +82,22 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
 
   const queue: QueueItem[] = [];
 
+  // finished-transfer rows auto-dismiss after the configured delay (plugin
+  // setting, live-synced); failed/canceled rows always stay for inspection
+  let transferClose = { enabled: true, delayMs: 3000 };
+  void loadStyleSettings().then((settings) => {
+    transferClose = {
+      enabled: settings.transferAutoClose,
+      delayMs: settings.transferAutoCloseDelay * 1000,
+    };
+  });
+  onStyleSettingsChanged((settings) => {
+    transferClose = {
+      enabled: settings.transferAutoClose,
+      delayMs: settings.transferAutoCloseDelay * 1000,
+    };
+  });
+
   // ---- queue rendering ----
   function makeQueueItem(name: string, direction: "up" | "down", size: number): QueueItem {
     const row = document.createElement("div");
@@ -107,12 +124,21 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
     row.querySelector("button")!.addEventListener("click", () => {
       if (item.status === "active") item.cancel?.();
       else {
-        row.remove();
+        removeQueueRow(row);
       }
     });
     queueBox.append(row);
     queue.push(item);
     return item;
+  }
+
+  // rows leave with a fade instead of vanishing: a bar that just showed 100%
+  // blinking out reads as "something went wrong"
+  const QUEUE_FADE_MS = 260;
+  function removeQueueRow(row: HTMLElement): void {
+    if (!row.isConnected || row.classList.contains("closing")) return;
+    row.classList.add("closing");
+    window.setTimeout(() => row.remove(), QUEUE_FADE_MS);
   }
 
   function updateItem(item: QueueItem): void {
@@ -128,6 +154,16 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
             : `${t("failed")}: ${item.error ?? ""}`;
     item.row.classList.toggle("done", item.status !== "active");
     item.row.classList.toggle("failed", item.status === "failed");
+    // schedule exactly once, on the transition into done — later updates
+    // (final byte counts) must not stack extra timers
+    if (item.status === "done" && !item.autoCloseScheduled) {
+      item.autoCloseScheduled = true;
+      if (transferClose.enabled) {
+        window.setTimeout(() => {
+          if (item.status === "done" && item.row.isConnected) removeQueueRow(item.row);
+        }, Math.max(0, transferClose.delayMs));
+      }
+    }
   }
 
   // ---- browsing ----

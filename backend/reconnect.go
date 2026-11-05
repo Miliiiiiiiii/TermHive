@@ -51,6 +51,32 @@ func (manager *Manager) autoReconnectEnabled() bool {
 	return !ok || value
 }
 
+// defaultReconnectMaxAttempts bounds the supervisor: an unreachable server
+// (VPN dropped, host down) would otherwise be retried forever — one attempt
+// per backoff tick, for as long as the sidecar lives. After this many FAILED
+// redials the supervisor gives up and hands the connection to the manual
+// reconnect overlay.
+const defaultReconnectMaxAttempts = 20
+
+// autoReconnectMaxAttempts reads the plugin setting (default 20, clamped
+// 1..500 — 0 would race the toggle off, absurd values just hammer servers).
+func (manager *Manager) autoReconnectMaxAttempts() int {
+	manager.mutex.Lock()
+	defer manager.mutex.Unlock()
+	value, ok := manager.settings["autoReconnectMaxAttempts"].(float64)
+	if !ok {
+		return defaultReconnectMaxAttempts
+	}
+	attempts := int(value)
+	if attempts < 1 {
+		attempts = 1
+	}
+	if attempts > 500 {
+		attempts = 500
+	}
+	return attempts
+}
+
 func (manager *Manager) currentEmitter() *dbxpluginsdk.Emitter {
 	manager.emitterMutex.Lock()
 	defer manager.emitterMutex.Unlock()
@@ -176,7 +202,16 @@ func (manager *Manager) superviseReconnect(connectionID string, cancel chan stru
 				manager.finishSupervision(connectionID)
 				return
 			}
-			manager.writeDiag(fmt.Sprintf("自动重连第 %d 次尝试失败: %s", attempt, err.Error()))
+			max := manager.autoReconnectMaxAttempts()
+			manager.writeDiag(fmt.Sprintf("自动重连第 %d/%d 次尝试失败: %s", attempt, max, err.Error()))
+			if attempt >= max {
+				manager.emit("connection.failed", map[string]any{
+					"connectionId": connectionID,
+					"reason":       fmt.Sprintf("已连续重试 %d 次未成功，等待手动重连（次数上限可在设置页调整）", attempt),
+				})
+				manager.finishSupervision(connectionID)
+				return
+			}
 			continue
 		}
 		manager.emit("connection.reconnected", map[string]any{

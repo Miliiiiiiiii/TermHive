@@ -35,6 +35,18 @@ export const DEFAULT_RULES: HighlightRule[] = [
 
 export const RULE_COLORS: HighlightRule["color"][] = ["red", "yellow", "blue", "green", "cyan", "magenta", "dim"];
 
+// display hex per rule color (mirrors the bright ANSI variants STYLES emit)
+// so the settings page can render each rule as a color swatch
+export const RULE_COLOR_HEX: Record<HighlightRule["color"], string> = {
+  red: "#f14c4c",
+  yellow: "#f5f543",
+  blue: "#3b8eea",
+  green: "#23d18b",
+  cyan: "#29b8db",
+  magenta: "#d670d6",
+  dim: "#767676",
+};
+
 // style presets: bold + bright foreground stay readable on dark and light
 // backgrounds; dim only lowers intensity
 const STYLES: Record<HighlightRule["color"], { start: string; end: string }> = {

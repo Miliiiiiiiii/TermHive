@@ -55,10 +55,15 @@ type Shell struct {
 	hideEnd       []byte
 	hideDeadline  time.Time
 	hideStarted   bool
-	// the sentinel occurs TWICE: once in the echoed input line, once in the
-	// echo command's OUTPUT — hiding must span both or the output line leaks
+	// the text sentinel occurs TWICE: once in the echoed input line, once in
+	// the echo command's OUTPUT — hiding must span both or the output line
+	// leaks (POSIX mode only)
 	hideSeenEcho bool
-	hideBuf      []byte
+	// close semantics: 1 = close at the FIRST hideEnd occurrence and emit the
+	// trigger bytes themselves (ConPTY shells, live OSC 7 trigger); 2 = close
+	// at the second occurrence, both swallowed (POSIX text sentinel)
+	hideCloseOn int
+	hideBuf     []byte
 
 	closed      atomic.Bool
 	closeMutex  sync.Mutex
@@ -89,9 +94,16 @@ const hideIdleWindow = 3 * time.Second
 
 // BeginHideWindow arms the echo-hiding window: scanning for startMarker
 // begins immediately, but bytes are only swallowed once it appears; hiding
-// ends at endMarker. The window self-cancels after hideIdleWindow of
-// silence (hiding is best effort and must never wedge the terminal).
-func (shell *Shell) BeginHideWindow(startMarker, endMarker string) {
+// ends at endMarker. closeOnNth picks the close semantics — 1 closes at the
+// first occurrence and EMITS the marker bytes themselves (the OSC 7 mode for
+// ConPTY shells: the trigger is a live escape sequence the echoed hook line
+// can never contain, so screen repaints re-delivering the echoed line cannot
+// close the window early); 2 closes at the second occurrence with both
+// swallowed (POSIX text-sentinel mode: the sentinel legitimately appears
+// twice, echoed input then echo output). The window self-cancels after
+// hideIdleWindow of silence (hiding is best effort and must never wedge the
+// terminal).
+func (shell *Shell) BeginHideWindow(startMarker, endMarker string, closeOnNth int) {
 	shell.suppressMutex.Lock()
 	defer shell.suppressMutex.Unlock()
 	shell.hideStart = []byte(startMarker)
@@ -99,6 +111,7 @@ func (shell *Shell) BeginHideWindow(startMarker, endMarker string) {
 	shell.hideDeadline = time.Now().Add(hideIdleWindow)
 	shell.hideStarted = false
 	shell.hideSeenEcho = false
+	shell.hideCloseOn = closeOnNth
 	shell.hideBuf = nil
 }
 
@@ -126,6 +139,87 @@ func lastCupEnd(buf []byte) int {
 	return best
 }
 
+// firstCupEnd returns the index just past the FIRST complete absolute
+// cursor-position sequence (ESC [ {row} ; {col} H/F) in buf, or -1. The live
+// OSC 7 filter splits paint regions at these: a CUP starts a new visual line.
+func firstCupEnd(buf []byte) int {
+	escape := []byte("\x1b[")
+	for i := 0; i+2 <= len(buf); {
+		idx := bytes.Index(buf[i:], escape)
+		if idx < 0 {
+			return -1
+		}
+		j := i + idx + 2
+		for j < len(buf) && (buf[j] == ';' || (buf[j] >= '0' && buf[j] <= '9')) {
+			j++
+		}
+		if j < len(buf) && (buf[j] == 'H' || buf[j] == 'F') && j > i+idx+2 {
+			return j + 1
+		}
+		i += idx + 2
+	}
+	return -1
+}
+
+// filterOsc7Regions is the OSC 7 close mode's rolling filter. The buffer is
+// walked in paint regions — a region ends at a newline (inclusive) or at the
+// end of a CUP sequence, whichever comes first — and every region WITHOUT the
+// hook marker flows out live (the user's keystrokes must never be held back
+// just because the window is open); regions WITH the marker — the echoed hook
+// line and any ConPTY repaint copies of it — are dropped. The first LIVE OSC
+// 7 trigger closes the window: its region is emitted (the follow feature
+// listens for those bytes), along with everything behind it. final=true is
+// the idle-expiry variant: the trailing incomplete region is decided now
+// (dropped only if it holds the marker) instead of being held for more bytes.
+// Returns the bytes to emit, the unconsumed tail (only when !done), done.
+func filterOsc7Regions(buf, marker, trigger []byte, final bool) (kept, tail []byte, done bool) {
+	kept = make([]byte, 0, len(buf))
+	pos := 0
+	for pos < len(buf) {
+		end := -1
+		if nl := bytes.IndexByte(buf[pos:], '\n'); nl >= 0 {
+			end = pos + nl + 1
+		}
+		if cup := firstCupEnd(buf[pos:]); cup > 0 && (end < 0 || pos+cup < end) {
+			end = pos + cup
+		}
+		if end < 0 {
+			break
+		}
+		region := buf[pos:end]
+		if at := bytes.Index(region, trigger); at >= 0 {
+			// the live trigger: emit its region (dropping any marker bytes
+			// glued ahead of it in the same region) plus everything after it
+			if bytes.Contains(region, marker) {
+				kept = append(kept, region[at:]...)
+			} else {
+				kept = append(kept, region...)
+			}
+			return kept, nil, true
+		}
+		if !bytes.Contains(region, marker) {
+			kept = append(kept, region...)
+		}
+		pos = end
+	}
+	tail = buf[pos:]
+	if at := bytes.Index(tail, trigger); at >= 0 {
+		if bytes.Contains(tail[:at], marker) {
+			kept = append(kept, tail[at:]...)
+		} else {
+			kept = append(kept, tail...)
+		}
+		return kept, nil, true
+	}
+	if final {
+		if !bytes.Contains(tail, marker) {
+			kept = append(kept, tail...)
+		}
+		return kept, nil, true
+	}
+	return kept, tail, false
+}
+
 // suppressChunk runs one flush through the hiding window. It returns the
 // bytes to emit (possibly none) and whether the hiding window is finished.
 func (shell *Shell) suppressChunk(chunk []byte) (emit []byte, done bool) {
@@ -142,20 +236,23 @@ func (shell *Shell) suppressChunk(chunk []byte) (emit []byte, done bool) {
 	}
 	if time.Now().After(shell.hideDeadline) {
 		// idle for the whole window: disarm and forward everything pending —
-		// but a final sentinel drop first, so expiring does not UNDO the
-		// hiding already achieved (the echoed line, and its output, may both
-		// still be in the buffer)
+		// but drop what the hiding already achieved first, so expiring does
+		// not UNDO it (the echoed hook line must not blurt out on expiry)
 		held := shell.hideBuf
-		drops := 1
-		if !shell.hideSeenEcho {
-			drops = 2
-		}
-		for ; drops > 0; drops-- {
-			at := bytes.Index(held, shell.hideEnd)
-			if at < 0 {
-				break
+		if shell.hideCloseOn == 1 {
+			held, _, _ = filterOsc7Regions(held, shell.hideStart, shell.hideEnd, true)
+		} else {
+			drops := 1
+			if !shell.hideSeenEcho {
+				drops = 2
 			}
-			held = held[at+len(shell.hideEnd):]
+			for ; drops > 0; drops-- {
+				at := bytes.Index(held, shell.hideEnd)
+				if at < 0 {
+					break
+				}
+				held = held[at+len(shell.hideEnd):]
+			}
 		}
 		shell.hideStart = nil
 		shell.hideEnd = nil
@@ -165,6 +262,31 @@ func (shell *Shell) suppressChunk(chunk []byte) (emit []byte, done bool) {
 		return append(held, chunk...), true
 	}
 	shell.hideBuf = append(shell.hideBuf, chunk...)
+	if shell.hideCloseOn == 1 {
+		// rolling region filter: user bytes flow live, marker regions (the
+		// echoed hook line and repaint copies of it) drop, first live OSC 7
+		// closes
+		kept, rest, closed := filterOsc7Regions(shell.hideBuf, shell.hideStart, shell.hideEnd, false)
+		if closed {
+			shell.hideStart = nil
+			shell.hideEnd = nil
+			shell.hideBuf = nil
+			return kept, true
+		}
+		shell.hideBuf = append([]byte(nil), rest...)
+		if len(shell.hideBuf) > 256*1024 {
+			// pathological repaint storm: never let the held tail wedge the
+			// stream — decide it now
+			marker, end := shell.hideStart, shell.hideEnd
+			shell.hideStart = nil
+			shell.hideEnd = nil
+			held := shell.hideBuf
+			shell.hideBuf = nil
+			out, _, _ := filterOsc7Regions(held, marker, end, true)
+			return append(kept, out...), true
+		}
+		return kept, false
+	}
 	if !shell.hideStarted {
 		at := bytes.Index(shell.hideBuf, shell.hideStart)
 		if at < 0 {
@@ -192,18 +314,18 @@ func (shell *Shell) suppressChunk(chunk []byte) (emit []byte, done bool) {
 		emit = append([]byte(nil), shell.hideBuf[:lineStart]...)
 		shell.hideBuf = append([]byte(nil), shell.hideBuf[lineStart:]...)
 	}
-	// hiding state. The sentinel appears twice (echoed input, then the echo
-	// output) and all of it — marker included — can arrive in ONE flush; the
-	// prompt renders after it and output goes silent, so waiting for "the
-	// next flush" to process the sentinels would freeze the window open —
-	// consume every occurrence already buffered before returning.
+	// hiding state. The close trigger — sentinel (twice) or OSC 7 (once) —
+	// and the whole echo can arrive in ONE flush; the prompt renders after it
+	// and output goes silent, so waiting for "the next flush" to process the
+	// markers would freeze the window open — consume what is already buffered
+	// before returning.
 	for {
 		at := bytes.Index(shell.hideBuf, shell.hideEnd)
 		if at < 0 {
 			break
 		}
 		rest := shell.hideBuf[at+len(shell.hideEnd):]
-		if !shell.hideSeenEcho {
+		if shell.hideCloseOn != 1 && !shell.hideSeenEcho {
 			// first occurrence = the echoed input line; the echo command's
 			// OUTPUT (sentinel again) may still be ahead — keep hiding so that
 			// line never reaches the terminal
@@ -211,12 +333,19 @@ func (shell *Shell) suppressChunk(chunk []byte) (emit []byte, done bool) {
 			shell.hideBuf = append([]byte(nil), rest...)
 			continue
 		}
+		// close. OSC 7 mode emits the trigger bytes themselves — the sequence
+		// IS the follow signal the UI listens for; sentinel mode swallows it
+		// with everything before it
+		out := rest
+		if shell.hideCloseOn == 1 {
+			out = shell.hideBuf[at:]
+		}
 		shell.hideStart = nil
 		shell.hideEnd = nil
 		shell.hideBuf = nil
 		shell.hideStarted = false
 		shell.hideSeenEcho = false
-		return append(emit, rest...), true
+		return append(emit, out...), true
 	}
 	if len(shell.hideBuf) > 256*1024 {
 		buffered := shell.hideBuf

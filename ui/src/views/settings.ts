@@ -33,15 +33,11 @@ export async function mountSettings(): Promise<() => void> {
     renderStylePop(panel, styleState, handleStyleChange);
   }
   void loadStyleSettings().then((next) => {
-    styleState.scheme = next.scheme;
-    styleState.highlight = next.highlight;
-    styleState.rules = next.rules;
+    Object.assign(styleState, next);
     render();
   });
   const offStyleEvent = onStyleSettingsChanged((next) => {
-    styleState.scheme = next.scheme;
-    styleState.highlight = next.highlight;
-    styleState.rules = next.rules;
+    Object.assign(styleState, next);
     render();
   });
 

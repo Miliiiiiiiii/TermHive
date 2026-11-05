@@ -6,7 +6,7 @@
 // plugin-level, never per-session.
 import { icon } from "./icon";
 import { t } from "./i18n";
-import { DEFAULT_RULES, RULE_COLORS, type HighlightRule } from "./highlight";
+import { DEFAULT_RULES, RULE_COLORS, RULE_COLOR_HEX, type HighlightRule } from "./highlight";
 import { SCHEMES } from "./theme";
 import { api, onSidecarEvent } from "./rpc";
 
@@ -16,7 +16,12 @@ export interface StyleSettings {
   rules: HighlightRule[];
   /** behavior toggles share the same settings blob (settings/put merges) */
   autoReconnect: boolean;
+  /** give up auto-reconnect after this many failed redials (backend clamps 1..500) */
+  autoReconnectMaxAttempts: number;
   sessionLog: boolean;
+  /** auto-remove finished transfer queue rows after this many seconds */
+  transferAutoClose: boolean;
+  transferAutoCloseDelay: number;
 }
 
 export function defaultStyleSettings(): StyleSettings {
@@ -25,7 +30,10 @@ export function defaultStyleSettings(): StyleSettings {
     highlight: true,
     rules: DEFAULT_RULES.map((rule) => ({ ...rule })),
     autoReconnect: true,
+    autoReconnectMaxAttempts: 20,
     sessionLog: false,
+    transferAutoClose: true,
+    transferAutoCloseDelay: 3,
   };
 }
 
@@ -34,7 +42,10 @@ type StoredSettings = {
   highlight?: boolean;
   rules?: HighlightRule[];
   autoReconnect?: boolean;
+  autoReconnectMaxAttempts?: number;
   sessionLog?: boolean;
+  transferAutoClose?: boolean;
+  transferAutoCloseDelay?: number;
 };
 
 function applyStored(settings: StyleSettings, stored: StoredSettings): void {
@@ -42,7 +53,20 @@ function applyStored(settings: StyleSettings, stored: StoredSettings): void {
   if (typeof stored.highlight === "boolean") settings.highlight = stored.highlight;
   if (Array.isArray(stored.rules) && stored.rules.length > 0) settings.rules = stored.rules;
   if (typeof stored.autoReconnect === "boolean") settings.autoReconnect = stored.autoReconnect;
+  if (
+    typeof stored.autoReconnectMaxAttempts === "number" &&
+    Number.isFinite(stored.autoReconnectMaxAttempts)
+  ) {
+    settings.autoReconnectMaxAttempts = Math.min(
+      500,
+      Math.max(1, Math.round(stored.autoReconnectMaxAttempts)),
+    );
+  }
   if (typeof stored.sessionLog === "boolean") settings.sessionLog = stored.sessionLog;
+  if (typeof stored.transferAutoClose === "boolean") settings.transferAutoClose = stored.transferAutoClose;
+  if (typeof stored.transferAutoCloseDelay === "number" && Number.isFinite(stored.transferAutoCloseDelay)) {
+    settings.transferAutoCloseDelay = Math.min(3600, Math.max(0, Math.round(stored.transferAutoCloseDelay)));
+  }
 }
 
 export async function loadStyleSettings(): Promise<StyleSettings> {
@@ -68,7 +92,10 @@ export function saveStyleSettings(settings: StyleSettings): void {
           highlight: settings.highlight,
           rules: settings.rules,
           autoReconnect: settings.autoReconnect,
+          autoReconnectMaxAttempts: settings.autoReconnectMaxAttempts,
           sessionLog: settings.sessionLog,
+          transferAutoClose: settings.transferAutoClose,
+          transferAutoCloseDelay: settings.transferAutoCloseDelay,
         },
       },
       15000,
@@ -98,6 +125,17 @@ const colorLabel = (): Record<string, string> => ({
   dim: t("colorDim"),
 });
 
+// exactly one color palette may be open at a time; module-level so opening
+// another swatch (or any full re-render) tears the previous one down with its
+// document listener
+let activePalette: { wrap: HTMLElement; dismiss: (event: Event) => void } | null = null;
+function closeColorPalette(): void {
+  if (!activePalette) return;
+  document.removeEventListener("pointerdown", activePalette.dismiss, true);
+  activePalette.wrap.remove();
+  activePalette = null;
+}
+
 // renderStylePop builds the whole settings panel into `pop`. Every mutation
 // clones the state, reports it through onChanged (the host view applies to
 // its terminals and saves — the broadcast then updates every other surface).
@@ -116,18 +154,11 @@ export function renderStylePop(
   };
   const commit = (patch: (draft: StyleSettings) => void): void => {
     const next: StyleSettings = {
-      scheme: state.scheme,
-      highlight: state.highlight,
+      ...state,
       rules: state.rules.map((rule) => ({ ...rule })),
-      autoReconnect: state.autoReconnect,
-      sessionLog: state.sessionLog,
     };
     patch(next);
-    state.scheme = next.scheme;
-    state.highlight = next.highlight;
-    state.rules = next.rules;
-    state.autoReconnect = next.autoReconnect;
-    state.sessionLog = next.sessionLog;
+    Object.assign(state, next);
     onChanged(next);
     // re-render only the reactive bits would be overkill; rebuild keeps
     // every control in sync with the state it just produced
@@ -161,7 +192,7 @@ export function renderStylePop(
   pop.append(toggleRow);
 
   section(t("behaviorLabel"));
-  const behaviorRow = (key: "autoReconnect" | "sessionLog"): void => {
+  const behaviorRow = (key: "sessionLog"): void => {
     const row = document.createElement("label");
     row.className = "settings-row";
     const box = document.createElement("input");
@@ -169,14 +200,78 @@ export function renderStylePop(
     box.checked = state[key];
     box.addEventListener("change", () => commit((draft) => (draft[key] = box.checked)));
     const text = document.createElement("span");
-    text.textContent = key === "autoReconnect" ? t("autoReconnectLabel") : t("sessionLogLabel");
+    text.textContent = t("sessionLogLabel");
     row.append(box, text);
     pop.append(row);
   };
-  behaviorRow("autoReconnect");
+  // auto-reconnect carries its give-up budget: after this many failed redials
+  // the supervisor stops and the manual-reconnect overlay takes over (an
+  // unreachable server would otherwise be retried forever)
+  {
+    const row = document.createElement("div");
+    row.className = "settings-row";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = state.autoReconnect;
+    box.addEventListener("change", () =>
+      commit((draft) => (draft.autoReconnect = box.checked)),
+    );
+    const text = document.createElement("span");
+    text.textContent = t("autoReconnectLabel");
+    const attemptsInput = document.createElement("input");
+    attemptsInput.type = "number";
+    attemptsInput.className = "num";
+    attemptsInput.min = "1";
+    attemptsInput.max = "500";
+    attemptsInput.step = "1";
+    attemptsInput.value = String(state.autoReconnectMaxAttempts);
+    attemptsInput.disabled = !state.autoReconnect;
+    attemptsInput.title = t("autoReconnectMaxTitle");
+    attemptsInput.addEventListener("change", () => {
+      const value = Math.min(500, Math.max(1, Math.round(Number(attemptsInput.value) || 1)));
+      attemptsInput.value = String(value);
+      commit((draft) => (draft.autoReconnectMaxAttempts = value));
+    });
+    const attemptsUnit = document.createElement("span");
+    attemptsUnit.className = "unit";
+    attemptsUnit.textContent = t("attemptsUnit");
+    row.append(box, text, attemptsInput, attemptsUnit);
+    pop.append(row);
+  }
   behaviorRow("sessionLog");
+  // finished-transfer rows: auto-dismiss after N seconds (0 = immediately,
+  // once the fade completes), off keeps them for manual inspection
+  const closeRow = document.createElement("div");
+  closeRow.className = "settings-row";
+  const closeBox = document.createElement("input");
+  closeBox.type = "checkbox";
+  closeBox.checked = state.transferAutoClose;
+  closeBox.addEventListener("change", () =>
+    commit((draft) => (draft.transferAutoClose = closeBox.checked)),
+  );
+  const closeText = document.createElement("span");
+  closeText.textContent = t("transferAutoCloseLabel");
+  const delayInput = document.createElement("input");
+  delayInput.type = "number";
+  delayInput.className = "num";
+  delayInput.min = "0";
+  delayInput.max = "3600";
+  delayInput.step = "1";
+  delayInput.value = String(state.transferAutoCloseDelay);
+  delayInput.disabled = !state.transferAutoClose;
+  delayInput.addEventListener("change", () => {
+    const value = Math.min(3600, Math.max(0, Math.round(Number(delayInput.value) || 0)));
+    delayInput.value = String(value);
+    commit((draft) => (draft.transferAutoCloseDelay = value));
+  });
+  const delayUnit = document.createElement("span");
+  delayUnit.className = "unit";
+  delayUnit.textContent = t("secondsUnit");
+  closeRow.append(closeBox, closeText, delayInput, delayUnit);
+  pop.append(closeRow);
 
-  section(t("rulesLabel"));  state.rules.forEach((rule, index) => {
+  section(t("rulesLabel"));
+  state.rules.forEach((rule, index) => {
     const row = document.createElement("div");
     row.className = "rule-row";
     const enable = document.createElement("input");
@@ -207,14 +302,49 @@ export function renderStylePop(
       }
       commit((draft) => (draft.rules[index].pattern = pattern.value));
     });
-    const color = document.createElement("select");
-    color.innerHTML = RULE_COLORS.map(
-      (value) => `<option value="${value}">${labels[value] ?? value}</option>`,
-    ).join("");
-    color.value = rule.color;
-    color.addEventListener("change", () =>
-      commit((draft) => (draft.rules[index].color = color.value as HighlightRule["color"])),
-    );
+    // color as a swatch + palette popover instead of a text dropdown: the
+    // rule colors are fixed ANSI presets, so seven blocks say more than seven
+    // names ever could
+    const color = document.createElement("button");
+    color.type = "button";
+    color.className = "rule-color";
+    color.title = labels[rule.color] ?? rule.color;
+    color.innerHTML = `<span class="swatch" style="background:${RULE_COLOR_HEX[rule.color]}"></span>`;
+    color.addEventListener("click", () => {
+      if (activePalette?.wrap.parentElement === color) {
+        closeColorPalette();
+        return;
+      }
+      closeColorPalette();
+      const palette = document.createElement("div");
+      palette.className = "rule-palette";
+      for (const value of RULE_COLORS) {
+        const swatchButton = document.createElement("button");
+        swatchButton.type = "button";
+        swatchButton.className = "sw";
+        if (value === rule.color) swatchButton.classList.add("active");
+        swatchButton.style.background = RULE_COLOR_HEX[value];
+        swatchButton.title = labels[value] ?? value;
+        swatchButton.addEventListener("click", () => {
+          closeColorPalette();
+          commit((draft) => (draft.rules[index].color = value));
+        });
+        palette.append(swatchButton);
+      }
+      const dismiss = (event: Event): void => {
+        // the row was re-rendered out from under us: just clean up
+        if (!palette.isConnected) {
+          closeColorPalette();
+          return;
+        }
+        const target = event.target as Node;
+        if (palette.contains(target) || color.contains(target)) return;
+        closeColorPalette();
+      };
+      document.addEventListener("pointerdown", dismiss, true);
+      activePalette = { wrap: palette, dismiss };
+      color.append(palette);
+    });
     const mode = document.createElement("select");
     mode.innerHTML =
       `<option value="line">${t("modeLine")}</option><option value="segment">${t("modeSegment")}</option>`;

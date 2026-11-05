@@ -432,12 +432,24 @@ func (manager *Manager) injectFollowHook(conn *Conn, shell *Shell) {
 		sentinel := "__th7_" + NewID("") + "__"
 		// anchor the hiding window on the echo of the line we type: hide
 		// from its first bytes (a distinctive prefix of the snippet) to the
-		// sentinel the snippet echoes
+		// close trigger
 		prefix := snippet
 		if len(prefix) > 16 {
 			prefix = prefix[:16]
 		}
-		shell.BeginHideWindow(prefix, sentinel)
+		if kind.hideClosesOnOsc7() {
+			// ConPTY shells close on the first LIVE OSC 7 and inject the bare
+			// snippet: no echo suffix means there is no delayed output that
+			// could ever leak, and repaint copies of the echoed line can no
+			// longer close the window early (see hideClosesOnOsc7)
+			shell.BeginHideWindow(prefix, osc7Trigger, 1)
+			err := shell.Write([]byte(snippet + "\n"))
+			if err != nil {
+				manager.writeDiag("follow hook write failed: " + err.Error())
+			}
+			return
+		}
+		shell.BeginHideWindow(prefix, sentinel, 2)
 		err := shell.Write([]byte(snippet + kind.echoSentinelSuffix(sentinel) + "\n"))
 		if err != nil {
 			manager.writeDiag("follow hook write failed: " + err.Error())

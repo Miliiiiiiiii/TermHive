@@ -53,6 +53,9 @@ async function main(): Promise<void> {
     // preview deep links (screenshot refresh, quick state inspection):
     // ?files=1 opens the file panel with the session; ?follow=1 additionally
     // starts the log viewer on the demo app.log once its row renders;
+    // ?download=1 clicks the app.log download button (queue demo, headless
+    // DOM dumps can then watch the row finish and auto-fade away);
+    // ?palette=1 opens the first rule's color palette on the settings page;
     // ?renderer=dom forces xterm's DOM renderer (headless screenshot hosts)
     if (params.get("files") === "1") context.openFiles = true;
     if (params.get("renderer") === "dom") document.documentElement.dataset.noWebgl = "1";
@@ -67,6 +70,29 @@ async function main(): Promise<void> {
         if (row) {
           window.clearInterval(deepLink);
           row.querySelector<HTMLButtonElement>('button[title*="tail -f"]')?.click();
+        }
+      }, 300);
+      window.setTimeout(() => window.clearInterval(deepLink), 8000);
+    }
+    if (params.get("download") === "1") {
+      const deepLink = window.setInterval(() => {
+        const row = Array.from(document.querySelectorAll<HTMLTableRowElement>(".fp-table tbody tr")).find((r) =>
+          r.textContent?.includes("app.log"),
+        );
+        if (row) {
+          window.clearInterval(deepLink);
+          // both locales: the title is the only locale-dependent part
+          row.querySelector<HTMLButtonElement>('button[title="下载"], button[title="Download"]')?.click();
+        }
+      }, 300);
+      window.setTimeout(() => window.clearInterval(deepLink), 8000);
+    }
+    if (params.get("palette") === "1" && view === "settings") {
+      const deepLink = window.setInterval(() => {
+        const button = document.querySelector<HTMLButtonElement>(".rule-color");
+        if (button) {
+          window.clearInterval(deepLink);
+          button.click();
         }
       }, 300);
       window.setTimeout(() => window.clearInterval(deepLink), 8000);

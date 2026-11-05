@@ -81,8 +81,10 @@ export function installMockBridge(context: Record<string, unknown>): void {
   let history = "";
   let counter = 0;
   const encoder = new TextEncoder();
-  const push = (channel: string, text: string): void => {
-    binaryHandlers.forEach((handler) => handler({ channel, data: encoder.encode(text) }));
+  const push = (channel: string, data: string | Uint8Array): void => {
+    binaryHandlers.forEach((handler) =>
+      handler({ channel, data: typeof data === "string" ? encoder.encode(data) : data }),
+    );
   };
 
   const demo = {
@@ -165,6 +167,19 @@ export function installMockBridge(context: Record<string, unknown>): void {
           return { transferId: "t-demo-" + ++counter };
         case "transfer/startDownload":
           return { transferId: "t-demo-" + ++counter, size: 1024 };
+        case "transfer/ready": {
+          // preview download demo: once the UI's listeners are registered,
+          // pump the promised bytes and finish, so the queue row walks
+          // through active → done (and the auto-close fade after it)
+          const id = String(params.transferId || "");
+          setTimeout(() => {
+            for (let i = 0; i < 4; i++) push(`down/${id}`, "A".repeat(256));
+            eventHandlers.forEach((handler) =>
+              handler({ method: "transfer.done", params: { transferId: id, ok: true } }),
+            );
+          }, 200);
+          return { ok: true };
+        }
         case "tail/start":
           return { taskId: "fw-demo" };
         case "tail/ready":
@@ -192,8 +207,10 @@ export function installMockBridge(context: Record<string, unknown>): void {
       throw new Error(`mock request: ${method}`);
     },
     notify: async (method: string, params: any = {}) => {
-      // the preview follow demo rides on the tail/ready notification
-      if (method === "tail/ready") return mock.invoke(method, params);
+      // preview demos ride on the tail/ready and transfer/ready notifications
+      if (method === "tail/ready" || method === "transfer/ready") {
+        return mock.invoke(method, params);
+      }
       return null;
     },
     sendBinary: async (channel: string, data: Uint8Array | string) => {

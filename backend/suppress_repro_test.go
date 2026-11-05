@@ -29,7 +29,7 @@ func TestHideWindowRealCmdStream(t *testing.T) {
 	echoOut := sentinel + "\x1b[14;1Hgordo@MILII C:\\Users\\gordo>\x1b[?25h"
 
 	shell := &Shell{}
-	shell.BeginHideWindow(marker, sentinel)
+	shell.BeginHideWindow(marker, sentinel, 2)
 
 	var out strings.Builder
 	feeds := []string{echoHead, echoTail, echoOut, "USER-TYPING"}
@@ -67,7 +67,7 @@ func TestHideWindowLateArmAfterPrompt(t *testing.T) {
 	snippet := " PROMPT $E]7;file:///$P$E\\gordo@MILII $P$G"
 	sentinel := "__th7_50317a9b97ee__"
 	shell := &Shell{}
-	shell.BeginHideWindow(snippet[:16], sentinel)
+	shell.BeginHideWindow(snippet[:16], sentinel, 2)
 	_ = time.Now
 
 	emit, done := shell.suppressChunk([]byte(" PROMPT $E]7;file:///$P$E\\gordo@MILII $P$G&echo " + sentinel))
