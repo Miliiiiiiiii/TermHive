@@ -261,18 +261,6 @@ func (kind shellKind) integrationSnippet(promptBase string) string {
 	return ""
 }
 
-// echoSentinelSuffix appends the marker echo that closes the hiding window
-// (the shell prints the sentinel; the output pump drops everything up to it).
-func (kind shellKind) echoSentinelSuffix(sentinel string) string {
-	switch kind {
-	case kindCmd:
-		return "&echo " + sentinel
-	case kindPowerShell, kindBash, kindZsh, kindFish:
-		return ";echo " + sentinel
-	}
-	return ""
-}
-
 func fieldOf(line, prefix string) string {
 	for _, field := range strings.Fields(line) {
 		if strings.HasPrefix(field, prefix) {
@@ -284,23 +272,12 @@ func fieldOf(line, prefix string) string {
 
 // osc7Trigger is the prefix of the live cwd report the hook makes the shell
 // emit on every prompt (see integrationSnippet). As a hide-window close
-// trigger it cannot be spoofed by the echoed hook line or by ConPTY screen
-// repaints of it: the snippet carries the sequence as TEXT ("$E]7;file://"),
-// while the escape bytes only exist once the shell actually renders a prompt
-// with the hook installed — which is exactly when hiding should end.
+// trigger it cannot be spoofed by the echoed hook line or by repaints of it
+// (ConPTY full-screen re-emissions, readline redraws): the snippet carries
+// the sequence as TEXT ("$E]7;file://" / '\033]7;file://'), while the escape
+// bytes only exist once the shell actually renders a prompt with the hook
+// installed — which is exactly when hiding should end.
 const osc7Trigger = "\x1b]7;file://"
-
-// hideClosesOnOsc7 selects the hide-window close semantics per shell family.
-// ConPTY repaints the whole screen on every window-change, re-delivering the
-// echoed hook line verbatim; under text-sentinel semantics those repaint
-// copies are indistinguishable from the real echo output, so the window
-// closes early (on a repaint copy) and the delayed real output — a cold cmd
-// can take seconds to execute the hook line — leaks onto the screen glued to
-// the user's first keystrokes ("no prompt, typing looks dead"). POSIX ptys
-// never repaint, so they keep the sentinel mechanism.
-func (kind shellKind) hideClosesOnOsc7() bool {
-	return kind == kindCmd || kind == kindPowerShell
-}
 
 func (conn *Conn) runCapture(command string) (string, error) {
 	session, err := conn.client.NewSession()

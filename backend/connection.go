@@ -417,10 +417,12 @@ func (manager *Manager) dial(conn *Conn, cols, rows int, emitter *dbxpluginsdk.E
 // later cls only erases the live screen while the bytes survive in the ring
 // buffer (replayed on attach) and in ConPTY's resize re-emission, which is
 // exactly the "opens with junk, one Enter fixes it" regression. Instead the
-// output pump swallows everything between the injection and a sentinel echo,
-// so the echo never enters the ring at all and the login banner stays
-// untouched. With a startup command configured the window is skipped — its
-// output may still be in flight and must not be eaten.
+// output pump drops every paint region carrying the hook line (echo and any
+// redraw copies of it) until the first LIVE OSC 7 report arrives — real
+// escape bytes the echoed text can never contain — so the echo never enters
+// the ring at all, the login banner stays untouched, and the user's own
+// keystrokes flow live throughout. With a startup command configured the
+// window is skipped — its output may still be in flight and must not be eaten.
 func (manager *Manager) injectFollowHook(conn *Conn, shell *Shell) {
 	kind := conn.detectShellKind()
 	snippet := kind.integrationSnippet(conn.promptBase)
@@ -429,28 +431,18 @@ func (manager *Manager) injectFollowHook(conn *Conn, shell *Shell) {
 		return
 	}
 	if conn.Spec.StartupCmd == "" {
-		sentinel := "__th7_" + NewID("") + "__"
-		// anchor the hiding window on the echo of the line we type: hide
-		// from its first bytes (a distinctive prefix of the snippet) to the
-		// close trigger
+		// hide the echo of the line we type (from a distinctive prefix of the
+		// snippet) until the first LIVE OSC 7 report proves the hook took
+		// effect. One mechanism for every shell family: the trigger is real
+		// escape bytes that no echo/redraw copy of the injected line can
+		// carry, and the rolling filter never holds the user's own keystrokes
+		// — the shell kind only shapes the snippet itself
 		prefix := snippet
 		if len(prefix) > 16 {
 			prefix = prefix[:16]
 		}
-		if kind.hideClosesOnOsc7() {
-			// ConPTY shells close on the first LIVE OSC 7 and inject the bare
-			// snippet: no echo suffix means there is no delayed output that
-			// could ever leak, and repaint copies of the echoed line can no
-			// longer close the window early (see hideClosesOnOsc7)
-			shell.BeginHideWindow(prefix, osc7Trigger, 1)
-			err := shell.Write([]byte(snippet + "\n"))
-			if err != nil {
-				manager.writeDiag("follow hook write failed: " + err.Error())
-			}
-			return
-		}
-		shell.BeginHideWindow(prefix, sentinel, 2)
-		err := shell.Write([]byte(snippet + kind.echoSentinelSuffix(sentinel) + "\n"))
+		shell.BeginHideWindow(prefix, osc7Trigger)
+		err := shell.Write([]byte(snippet + "\n"))
 		if err != nil {
 			manager.writeDiag("follow hook write failed: " + err.Error())
 		}

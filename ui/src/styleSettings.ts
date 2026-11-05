@@ -6,7 +6,8 @@
 // plugin-level, never per-session.
 import { icon } from "./icon";
 import { t } from "./i18n";
-import { DEFAULT_RULES, RULE_COLORS, RULE_COLOR_HEX, type HighlightRule } from "./highlight";
+import { notify } from "./notify";
+import { DEFAULT_RULES, RULE_COLORS, RULE_COLOR_HEX, isRuleColor, type HighlightRule } from "./highlight";
 import { SCHEMES } from "./theme";
 import { api, onSidecarEvent } from "./rpc";
 
@@ -51,7 +52,14 @@ type StoredSettings = {
 function applyStored(settings: StyleSettings, stored: StoredSettings): void {
   if (typeof stored.scheme === "string" && stored.scheme) settings.scheme = stored.scheme;
   if (typeof stored.highlight === "boolean") settings.highlight = stored.highlight;
-  if (Array.isArray(stored.rules) && stored.rules.length > 0) settings.rules = stored.rules;
+  if (Array.isArray(stored.rules)) {
+    // colors may be preset names (legacy) or wheel-picked #rrggbb; anything
+    // else in a hand-edited settings.json falls back to a sane default
+    const rules = stored.rules
+      .filter((rule) => rule && typeof rule.pattern === "string")
+      .map((rule) => ({ ...rule, color: isRuleColor(rule.color) ? rule.color : "cyan" }));
+    if (rules.length > 0) settings.rules = rules;
+  }
   if (typeof stored.autoReconnect === "boolean") settings.autoReconnect = stored.autoReconnect;
   if (
     typeof stored.autoReconnectMaxAttempts === "number" &&
@@ -134,6 +142,225 @@ function closeColorPalette(): void {
   document.removeEventListener("pointerdown", activePalette.dismiss, true);
   activePalette.wrap.remove();
   activePalette = null;
+}
+
+// ---- color wheel picker ----
+//
+// HSV wheel (hue by angle, saturation by radius) plus a brightness strip, a
+// hex field and — where the host allows it — the EyeDropper API for picking
+// straight off the screen. Presets stay one click away: they commit the
+// preset NAME, keeping the tuned bright-ANSI codes; wheel picks commit
+// #rrggbb, rendered as 24-bit truecolor by the highlighter.
+
+function hsvToRgb(h: number, s: number, v: number): [number, number, number] {
+  const channel = (n: number): number => {
+    const k = (n + h / 60) % 6;
+    return Math.round((v - v * s * Math.max(0, Math.min(k, 4 - k, 1))) * 255);
+  };
+  return [channel(5), channel(3), channel(1)];
+}
+
+function rgbToHex(r: number, g: number, b: number): string {
+  return `#${[r, g, b].map((c) => c.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function hexToHsv(hex: string): [number, number, number] {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  const value = m ? parseInt(m[1], 16) : 0x29b8db;
+  const r = ((value >> 16) & 255) / 255;
+  const g = ((value >> 8) & 255) / 255;
+  const b = (value & 255) / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const d = max - min;
+  let h = 0;
+  if (d > 0) {
+    if (max === r) h = 60 * (((g - b) / d) % 6);
+    else if (max === g) h = 60 * ((b - r) / d + 2);
+    else h = 60 * ((r - g) / d + 4);
+  }
+  if (h < 0) h += 360;
+  return [h, max === 0 ? 0 : d / max, max];
+}
+
+// openColorWheel mounts the picker under `anchor`. onPreview fires on every
+// drag step (live-update the rule's swatch, no commit), onDone fires once
+// with the final value (hex from the wheel, preset name from the preset row)
+// and closes the picker.
+function openColorWheel(
+  anchor: HTMLElement,
+  initialHex: string,
+  onPreview: (hex: string) => void,
+  onDone: (color: string) => void,
+): void {
+  closeColorPalette();
+  const state = { h: 0, s: 0, v: 1 };
+  [state.h, state.s, state.v] = hexToHsv(initialHex);
+
+  const wrap = document.createElement("div");
+  wrap.className = "rule-palette color-wheel-pop";
+
+  const wheelBox = document.createElement("div");
+  wheelBox.className = "wheel-box";
+  const pixels = 168;
+  const canvas = document.createElement("canvas");
+  canvas.width = pixels * 2;
+  canvas.height = pixels * 2;
+  const marker = document.createElement("div");
+  marker.className = "wheel-marker";
+  wheelBox.append(canvas, marker);
+
+  const drawWheel = (): void => {
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const size = canvas.width;
+    const center = size / 2;
+    const image = ctx.createImageData(size, size);
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const dx = x - center;
+        const dy = y - center;
+        const radius = Math.sqrt(dx * dx + dy * dy);
+        if (radius > center) continue;
+        const hue = ((Math.atan2(dy, dx) * 180) / Math.PI + 360) % 360;
+        const [r, g, b] = hsvToRgb(hue, radius / center, state.v);
+        const at = (y * size + x) * 4;
+        image.data[at] = r;
+        image.data[at + 1] = g;
+        image.data[at + 2] = b;
+        image.data[at + 3] = 255;
+      }
+    }
+    ctx.putImageData(image, 0, 0);
+  };
+
+  const bright = document.createElement("input");
+  bright.type = "range";
+  bright.className = "wheel-bright";
+  bright.min = "6";
+  bright.max = "100";
+  bright.step = "1";
+  bright.value = String(Math.round(state.v * 100));
+
+  const hexInput = document.createElement("input");
+  hexInput.type = "text";
+  hexInput.className = "wheel-hex";
+  hexInput.maxLength = 7;
+  hexInput.spellcheck = false;
+
+  const drop = document.createElement("button");
+  drop.type = "button";
+  drop.className = "icon-btn wheel-drop";
+  drop.title = t("eyedropperTitle");
+  drop.innerHTML = icon("dropper", 14);
+  drop.addEventListener("click", () => {
+    const Picker = (window as unknown as { EyeDropper?: new () => { open(): Promise<{ sRGBHex: string }> } }).EyeDropper;
+    if (!Picker) {
+      notify(t("eyedropperUnsupported"), "info");
+      return;
+    }
+    new Picker()
+      .open()
+      .then((result) => {
+        const hex = result.sRGBHex.toLowerCase();
+        [state.h, state.s, state.v] = hexToHsv(hex);
+        drawWheel();
+        bright.value = String(Math.round(state.v * 100));
+        sync();
+        closeColorPalette();
+        onDone(hex);
+      })
+      .catch(() => undefined); // user pressed Esc — keep the picker open
+  });
+
+  const presets = document.createElement("div");
+  presets.className = "wheel-presets";
+  const presetLabels = colorLabel();
+  for (const name of RULE_COLORS) {
+    const swatchButton = document.createElement("button");
+    swatchButton.type = "button";
+    swatchButton.className = "sw";
+    swatchButton.style.background = RULE_COLOR_HEX[name];
+    swatchButton.title = presetLabels[name] ?? name;
+    swatchButton.addEventListener("click", () => {
+      closeColorPalette();
+      onDone(name);
+    });
+    presets.append(swatchButton);
+  }
+
+  const sync = (): void => {
+    const hex = rgbToHex(...hsvToRgb(state.h, state.s, state.v));
+    hexInput.value = hex;
+    const angle = (state.h * Math.PI) / 180;
+    const center = pixels / 2;
+    marker.style.left = `${center + Math.cos(angle) * state.s * center}px`;
+    marker.style.top = `${center + Math.sin(angle) * state.s * center}px`;
+    onPreview(hex);
+  };
+
+  let dragging = false;
+  const fromPointer = (event: PointerEvent): void => {
+    const rect = canvas.getBoundingClientRect();
+    const dx = event.clientX - rect.left - rect.width / 2;
+    const dy = event.clientY - rect.top - rect.height / 2;
+    const radius = Math.min(Math.sqrt(dx * dx + dy * dy), rect.width / 2);
+    state.h = ((Math.atan2(dy, dx) * 180) / Math.PI + 360) % 360;
+    state.s = radius / (rect.width / 2);
+    sync();
+  };
+  canvas.addEventListener("pointerdown", (event) => {
+    dragging = true;
+    canvas.setPointerCapture(event.pointerId);
+    fromPointer(event);
+  });
+  canvas.addEventListener("pointermove", (event) => {
+    if (dragging) fromPointer(event);
+  });
+  canvas.addEventListener("pointerup", (event) => {
+    dragging = false;
+    canvas.releasePointerCapture(event.pointerId);
+    closeColorPalette();
+    onDone(rgbToHex(...hsvToRgb(state.h, state.s, state.v)));
+  });
+
+  bright.addEventListener("input", () => {
+    state.v = Number(bright.value) / 100;
+    drawWheel();
+    sync();
+  });
+  hexInput.addEventListener("change", () => {
+    const candidate = hexInput.value.trim().startsWith("#")
+      ? hexInput.value.trim()
+      : `#${hexInput.value.trim()}`;
+    if (!/^#[0-9a-f]{6}$/i.test(candidate)) {
+      sync(); // revert the field to the current color
+      return;
+    }
+    closeColorPalette();
+    onDone(candidate.toLowerCase());
+  });
+
+  const hexRow = document.createElement("div");
+  hexRow.className = "wheel-row";
+  hexRow.append(hexInput, drop);
+
+  wrap.append(wheelBox, bright, hexRow, presets);
+  drawWheel();
+  sync();
+
+  const dismiss = (event: Event): void => {
+    if (!wrap.isConnected) {
+      closeColorPalette();
+      return;
+    }
+    const target = event.target as Node;
+    if (wrap.contains(target) || anchor.contains(target)) return;
+    closeColorPalette();
+  };
+  document.addEventListener("pointerdown", dismiss, true);
+  activePalette = { wrap, dismiss };
+  anchor.append(wrap);
 }
 
 // renderStylePop builds the whole settings panel into `pop`. Every mutation
@@ -302,48 +529,31 @@ export function renderStylePop(
       }
       commit((draft) => (draft.rules[index].pattern = pattern.value));
     });
-    // color as a swatch + palette popover instead of a text dropdown: the
-    // rule colors are fixed ANSI presets, so seven blocks say more than seven
-    // names ever could
+    // color as a swatch opening the wheel picker: presets stay one click
+    // away, custom picks ride 24-bit truecolor
     const color = document.createElement("button");
     color.type = "button";
     color.className = "rule-color";
+    const ruleHex = rule.color.startsWith("#")
+      ? rule.color
+      : (RULE_COLOR_HEX[rule.color] ?? "#29b8db");
     color.title = labels[rule.color] ?? rule.color;
-    color.innerHTML = `<span class="swatch" style="background:${RULE_COLOR_HEX[rule.color]}"></span>`;
+    color.innerHTML = `<span class="swatch" style="background:${ruleHex}"></span>`;
     color.addEventListener("click", () => {
       if (activePalette?.wrap.parentElement === color) {
         closeColorPalette();
         return;
       }
-      closeColorPalette();
-      const palette = document.createElement("div");
-      palette.className = "rule-palette";
-      for (const value of RULE_COLORS) {
-        const swatchButton = document.createElement("button");
-        swatchButton.type = "button";
-        swatchButton.className = "sw";
-        if (value === rule.color) swatchButton.classList.add("active");
-        swatchButton.style.background = RULE_COLOR_HEX[value];
-        swatchButton.title = labels[value] ?? value;
-        swatchButton.addEventListener("click", () => {
-          closeColorPalette();
-          commit((draft) => (draft.rules[index].color = value));
-        });
-        palette.append(swatchButton);
-      }
-      const dismiss = (event: Event): void => {
-        // the row was re-rendered out from under us: just clean up
-        if (!palette.isConnected) {
-          closeColorPalette();
-          return;
-        }
-        const target = event.target as Node;
-        if (palette.contains(target) || color.contains(target)) return;
-        closeColorPalette();
-      };
-      document.addEventListener("pointerdown", dismiss, true);
-      activePalette = { wrap: palette, dismiss };
-      color.append(palette);
+      openColorWheel(
+        color,
+        ruleHex,
+        (hex) => {
+          // live preview while dragging — no commit, no re-render
+          const swatch = color.querySelector<HTMLElement>(".swatch");
+          if (swatch) swatch.style.background = hex;
+        },
+        (picked) => commit((draft) => (draft.rules[index].color = picked)),
+      );
     });
     const mode = document.createElement("select");
     mode.innerHTML =

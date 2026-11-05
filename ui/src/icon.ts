@@ -29,6 +29,7 @@ const paths: Record<string, string> = {
   code: `<path d="m8 8-4 4 4 4"/><path d="m16 8 4 4-4 4"/><path d="M13.5 5.5 10.5 18.5"/>`,
   palette: `<path d="M12 3a9 9 0 1 0 0 18c1.1 0 2-.9 2-2 0-.5-.2-1-.5-1.4-.3-.3-.5-.8-.5-1.3 0-1 .9-1.8 2-1.8h2.4A3.6 3.6 0 0 0 21 10.9C20.6 6.5 16.7 3 12 3Z"/><circle cx="7.5" cy="11" r="1"/><circle cx="10.5" cy="7.5" r="1"/><circle cx="15" cy="7.8" r="1"/>`,
   follow: `<path d="M3 12h4l2-7 4 14 2-7h6"/>`,
+  dropper: `<path d="m11 7 6 6"/><path d="m13.5 4.5 6 6"/><path d="M13 8 4 17l-1 4 4-1 9-9"/>`,
 };
 
 export function icon(name: keyof typeof paths | string, size = 16): string {

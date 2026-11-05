@@ -13,7 +13,9 @@ export interface HighlightRule {
   name: string;
   // JavaScript regex source, matched case-insensitively
   pattern: string;
-  color: "red" | "yellow" | "blue" | "green" | "cyan" | "magenta" | "dim";
+  // an ANSI preset name (RULE_PRESETS) or a custom #rrggbb picked on the
+  // color wheel — custom colors render as 24-bit truecolor escapes
+  color: string;
   // line = tint the whole line, segment = color the matched span only
   mode: "line" | "segment";
   enabled: boolean;
@@ -33,11 +35,14 @@ export const DEFAULT_RULES: HighlightRule[] = [
   { id: "ok", name: "SUCCESS", pattern: "\\b(SUCCESS|DONE|OK)\\b|成功", color: "green", mode: "segment", enabled: true },
 ];
 
-export const RULE_COLORS: HighlightRule["color"][] = ["red", "yellow", "blue", "green", "cyan", "magenta", "dim"];
+export const RULE_PRESETS = ["red", "yellow", "blue", "green", "cyan", "magenta", "dim"] as const;
 
-// display hex per rule color (mirrors the bright ANSI variants STYLES emit)
-// so the settings page can render each rule as a color swatch
-export const RULE_COLOR_HEX: Record<HighlightRule["color"], string> = {
+// legacy alias: the preset list (rule colors may now also be custom hex)
+export const RULE_COLORS: string[] = [...RULE_PRESETS];
+
+// display hex per preset color (mirrors the bright ANSI variants the presets
+// emit) so the settings page can render each rule as a color swatch
+export const RULE_COLOR_HEX: Record<string, string> = {
   red: "#f14c4c",
   yellow: "#f5f543",
   blue: "#3b8eea",
@@ -49,7 +54,7 @@ export const RULE_COLOR_HEX: Record<HighlightRule["color"], string> = {
 
 // style presets: bold + bright foreground stay readable on dark and light
 // backgrounds; dim only lowers intensity
-const STYLES: Record<HighlightRule["color"], { start: string; end: string }> = {
+const STYLES: Record<string, { start: string; end: string }> = {
   red: { start: "\x1b[1;91m", end: "\x1b[22;39m" },
   yellow: { start: "\x1b[1;93m", end: "\x1b[22;39m" },
   blue: { start: "\x1b[1;94m", end: "\x1b[22;39m" },
@@ -58,6 +63,33 @@ const STYLES: Record<HighlightRule["color"], { start: string; end: string }> = {
   magenta: { start: "\x1b[1;95m", end: "\x1b[22;39m" },
   dim: { start: "\x1b[2;90m", end: "\x1b[22;39m" },
 };
+
+// hexToRgb parses #rgb / #rrggbb; null when not a hex color
+function hexToRgb(color: string): [number, number, number] | null {
+  const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(color.trim());
+  if (!hex) return null;
+  let digits = hex[1];
+  if (digits.length === 3) {
+    digits = digits[0] + digits[0] + digits[1] + digits[1] + digits[2] + digits[2];
+  }
+  const value = parseInt(digits, 16);
+  return [(value >> 16) & 255, (value >> 8) & 255, value & 255];
+}
+
+// isRuleColor: valid stored value — a known preset or a #rrggbb custom pick
+export function isRuleColor(color: unknown): color is string {
+  return typeof color === "string" && (color in STYLES || hexToRgb(color) !== null);
+}
+
+// styleFor maps a rule color to the SGR pair the highlighter injects.
+// Presets keep their tuned bright-ANSI codes; custom wheel picks become
+// 24-bit truecolor (bold + 38;2;r;g;b), which xterm renders exactly.
+export function styleFor(color: string): { start: string; end: string } {
+  if (STYLES[color]) return STYLES[color];
+  const rgb = hexToRgb(color);
+  if (rgb) return { start: `\x1b[1;38;2;${rgb[0]};${rgb[1]};${rgb[2]}m`, end: "\x1b[22;39m" };
+  return STYLES.cyan;
+}
 
 // ANSI CSI/OSC sequence matcher — styled lines are re-emitted as plain text
 // with injected codes, so escapes must be stripped before matching
@@ -115,7 +147,7 @@ export class Highlighter {
       if (rule.mode === "line") {
         regex.lastIndex = 0;
         if (regex.test(text)) {
-          const style = STYLES[rule.color];
+          const style = styleFor(rule.color);
           return style.start + text + style.end;
         }
         continue;
@@ -134,7 +166,7 @@ export class Highlighter {
       }
       for (let i = ranges.length - 1; i >= 0; i--) {
         const [start, end] = ranges[i];
-        const style = STYLES[rule.color];
+        const style = styleFor(rule.color);
         text = text.slice(0, start) + style.start + text.slice(start, end) + style.end + text.slice(end);
       }
     }

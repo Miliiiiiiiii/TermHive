@@ -513,6 +513,47 @@ input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):focus, selec
 .rule-palette .sw:hover { transform: scale(1.1); }
 .rule-palette .sw.active { outline: 2px solid var(--accent); outline-offset: 1px; }
 
+/* color wheel picker popover */
+.color-wheel-pop {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 196px;
+  padding: 10px;
+}
+.wheel-box { position: relative; width: 168px; height: 168px; align-self: center; }
+.wheel-box canvas {
+  width: 168px;
+  height: 168px;
+  border-radius: 50%;
+  cursor: crosshair;
+  touch-action: none;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.3);
+}
+.wheel-marker {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.65), inset 0 0 0 1px rgba(0, 0, 0, 0.65);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+.wheel-bright { width: 100%; accent-color: var(--accent); }
+.wheel-hex {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  padding: 0 7px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.wheel-drop { width: 26px; height: 26px; flex: none; }
+.color-wheel-pop .wheel-row { display: flex; gap: 6px; align-items: center; }
+.wheel-presets { display: flex; gap: 5px; justify-content: space-between; }
+.wheel-presets .sw { width: 22px; height: 22px; }
+
 /* number input + unit inside a settings row (delay seconds etc.).
    [type="number"] keeps the selector at (0,3,1) so it ties the global input
    rule and wins by source order — a plain .num class would lose height. */

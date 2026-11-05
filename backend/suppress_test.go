@@ -6,6 +6,15 @@ import (
 	"time"
 )
 
+// All hide-window fixtures share the one mechanism: regions carrying the hook
+// marker (the echoed injection line and any redraw copies of it) are dropped;
+// everything else — banner, user keystrokes — flows live; the first LIVE OSC 7
+// sequence closes the window and is emitted (the follow feature listens for
+// it). Echoed snippets only ever carry the sequence as "$E]7;" / '\033]7;'
+// TEXT, never the escape byte, so echo/redraw copies cannot spoof the close.
+
+const testOsc7 = "\x1b]7;file://"
+
 func feed(t *testing.T, shell *Shell, chunks []string) string {
 	t.Helper()
 	out := ""
@@ -22,57 +31,64 @@ func feed(t *testing.T, shell *Shell, chunks []string) string {
 
 func TestHideWindowBannerSurvives(t *testing.T) {
 	shell := &Shell{}
-	snippet := ` __osc7(){ printf 'x'; };PROMPT_COMMAND="__osc7"`
-	sentinel := "__th7_abc__"
-	shell.BeginHideWindow(snippet[:16], sentinel, 2)
+	snippet := ` __osc7(){ printf '\033]7;file://%s\033\134' "$PWD"; };PROMPT_COMMAND="__osc7"`
+	shell.BeginHideWindow(snippet[:16], osc7Trigger)
 
-	// banner first, then the echoed injection line (sentinel occurrence #1),
-	// then the echo output (occurrence #2) and the bytes that follow
+	// banner first, then the echoed injection line (bash/readline echo),
+	// user keystrokes while the window is still open, and finally the first
+	// prompt rendered with the hook live (OSC 7 + PS1)
 	got := feed(t, shell, []string{
-		"TEST-BANNER\r\n",
-		"ECHO:" + snippet + ";echo " + sentinel,
-		"\r\n\x1b]7;file:///C:\\x\x1b\\",
-		sentinel + "\r\nrest-of-stream",
+		"Last login: Thu Nov 5 16:52 from 10.0.0.9\r\n",
+		"root@server:~# " + snippet + "\r\n",
+		"echo ZZMARK7\r",
+		testOsc7 + "/root\x1b\\root@server:~# ",
 	})
-	if !strings.Contains(got, "TEST-BANNER") {
+	if !strings.Contains(got, "Last login") {
 		t.Errorf("banner was eaten: %q", got)
 	}
-	if strings.Contains(got, "__osc7") || strings.Contains(got, sentinel) {
+	if strings.Contains(got, "__osc7") {
 		t.Errorf("injection echo leaked: %q", got)
 	}
-	if !strings.Contains(got, "rest-of-stream") {
-		t.Errorf("post-sentinel bytes missing: %q", got)
+	if !strings.Contains(got, "echo ZZMARK7") {
+		t.Errorf("user keystrokes held past the close: %q", got)
+	}
+	if !strings.Contains(got, testOsc7+"/root") {
+		t.Errorf("live OSC 7 must be emitted — the follow feature listens for it: %q", got)
+	}
+	if !strings.Contains(got, "root@server:~#") {
+		t.Errorf("post-close prompt missing: %q", got)
 	}
 }
 
 func TestHideWindowMarkerSplitAcrossFlushes(t *testing.T) {
 	shell := &Shell{}
 	snippet := " __osc7(){ printf"
-	sentinel := "__th7_q__"
-	shell.BeginHideWindow(snippet, sentinel, 2)
+	shell.BeginHideWindow(snippet, osc7Trigger)
 
 	got := feed(t, shell, []string{
 		"TEST-BANNER\r\nECHO:",
-		" __osc7",                            // marker split: first half
-		"(){ printf hook stuff;echo __th7_q", // marker complete + echo, sentinel split
-		"__\r\n",                             // echo line complete (occurrence #1)
-		"\x1b[?25l",
-		sentinel + "AFTER", // echo output (occurrence #2) + tail
+		" __osc7",                 // marker split: first half
+		"(){ printf hook stuff\r", // marker complete; line still open
+		"\nmore-output\r\n",      // echo line closed — dropped
+		testOsc7 + "/x\x1b\\AFTER",
 	})
 	if !strings.Contains(got, "TEST-BANNER") {
 		t.Errorf("banner was eaten: %q", got)
 	}
-	if strings.Contains(got, "osc7") || strings.Contains(got, sentinel) {
+	if strings.Contains(got, "osc7") {
 		t.Errorf("injection echo leaked: %q", got)
 	}
+	if !strings.Contains(got, "more-output") {
+		t.Errorf("non-marker bytes between echo and close must flow live: %q", got)
+	}
 	if !strings.Contains(got, "AFTER") {
-		t.Errorf("post-sentinel bytes missing: %q", got)
+		t.Errorf("post-trigger bytes missing: %q", got)
 	}
 }
 
 func TestHideWindowDeadlineFallback(t *testing.T) {
 	shell := &Shell{}
-	shell.BeginHideWindow(" __osc7", "SENT", 2)
+	shell.BeginHideWindow(" __osc7", testOsc7)
 	// the window survives while bytes keep flowing; it disarms only after
 	// hideIdleWindow of SILENCE
 	time.Sleep(hideIdleWindow + 150*time.Millisecond)
@@ -82,100 +98,94 @@ func TestHideWindowDeadlineFallback(t *testing.T) {
 	}
 }
 
-// the frozen-screen regression: when the whole handshake (marker, echoed
-// sentinel, echo output sentinel, prompt) lands in ONE flush, the window must
-// close in that same call — the prompt renders afterwards and output goes
-// silent, so a state machine that waits for the next flush never runs
-func TestHideWindowBothSentinelsSameFlush(t *testing.T) {
+// the frozen-screen regression: when the whole handshake lands in ONE flush
+// (marker line, the live OSC 7, the prompt), the window must close in that
+// same call — the prompt renders afterwards and output goes silent, so
+// waiting for "the next flush" would freeze the window open
+func TestHideWindowWholeHandshakeSameFlush(t *testing.T) {
 	shell := &Shell{}
 	snippet := ` PROMPT $E]7;file:///$P$E\gordo@MILII $P$G`
-	sentinel := "__th7_x__"
-	shell.BeginHideWindow(snippet[:16], sentinel, 2)
+	shell.BeginHideWindow(snippet[:16], osc7Trigger)
 
 	emit, done := shell.suppressChunk([]byte(
 		"Microsoft Windows [版本 10.0.26200.9711]\r\n" +
 			"(c) Microsoft Corporation。保留所有权利。\r\n" +
-			"gordo@MILII C:\\Users\\gordo>" + snippet + "&echo " + sentinel + "\r\n" +
-			sentinel + "\r\n" +
-			"\x1b[6;1Hgordo@MILII C:\\Users\\gordo>"))
+			"gordo@MILII C:\\Users\\gordo>" + snippet + "\r\n" +
+			"\x1b[6;1H" + testOsc7 + "/C:\\Users\\gordo\x1b\\gordo@MILII C:\\Users\\gordo>"))
 	if !done {
-		t.Fatalf("window must close on the flush carrying both sentinels, emit=%q", emit)
+		t.Fatalf("window must close on the flush carrying the live OSC 7, emit=%q", emit)
 	}
 	got := string(emit)
 	if !strings.Contains(got, "Microsoft Windows") || !strings.Contains(got, "(c) Microsoft") {
 		t.Errorf("banner was eaten: %q", got)
 	}
-	if strings.Contains(got, "PROMPT $E") || strings.Contains(got, sentinel) {
+	if strings.Contains(got, "PROMPT $E") {
 		t.Errorf("injection echo leaked: %q", got)
 	}
+	if !strings.Contains(got, testOsc7+"/C:\\Users\\gordo") {
+		t.Errorf("live OSC 7 must be emitted: %q", got)
+	}
 	if !strings.Contains(got, "gordo@MILII C:\\Users\\gordo>") {
-		t.Errorf("post-sentinel prompt missing: %q", got)
+		t.Errorf("post-close prompt missing: %q", got)
 	}
 }
 
 // ConPTY positions the prompt with an absolute cursor sequence instead of a
-// newline; the swallow must start there, not at the previous newline (which
-// would eat the banner's copyright line together with the prompt)
+// newline; a CUP closes the previous paint region, so the banner's copyright
+// line must survive the echo-line drop
 func TestHideWindowCupKeepsCopyright(t *testing.T) {
 	shell := &Shell{}
 	snippet := ` PROMPT $E]7;file:///$P$E\gordo@MILII $P$G`
-	sentinel := "__th7_y__"
-	shell.BeginHideWindow(snippet[:16], sentinel, 2)
+	shell.BeginHideWindow(snippet[:16], osc7Trigger)
 
 	emit, done := shell.suppressChunk([]byte(
 		"Microsoft Windows [版本 10.0.26200.9711]\r\n" +
 			"(c) Microsoft Corporation。保留所有权利。" + // no newline: CUP follows
 			"\x1b[6;1H" +
-			"gordo@MILII C:\\Users\\gordo>" + snippet + "&echo " + sentinel + "\r\n" +
-			sentinel + "\r\n" +
-			"\x1b[7;1Hgordo@MILII C:\\Users\\gordo>"))
+			"gordo@MILII C:\\Users\\gordo>" + snippet + "\r\n" +
+			"\x1b[7;1H" + testOsc7 + "/C:\\x\x1b\\gordo@MILII C:\\Users\\gordo>"))
 	if !done {
 		t.Fatalf("window must close in-flush, emit=%q", emit)
 	}
 	got := string(emit)
 	if !strings.Contains(got, "(c) Microsoft Corporation") {
-		t.Errorf("copyright line was eaten by the newline-based swallow: %q", got)
+		t.Errorf("copyright line was eaten by the region drop: %q", got)
 	}
-	if strings.Contains(got, "PROMPT $E") || strings.Contains(got, sentinel) {
+	if strings.Contains(got, "PROMPT $E") {
 		t.Errorf("injection echo leaked: %q", got)
 	}
 }
 
-// the idle-expiry fallback must drop BOTH buffered sentinel occurrences, or
-// the second one leaks into the terminal as junk text
-func TestHideWindowExpiryDropsBothSentinels(t *testing.T) {
+// the idle-expiry fallback must drop the echoed hook line (marker regions and
+// a marker-carrying tail), or it blurts into the terminal as junk text
+func TestHideWindowExpiryDropsEchoLine(t *testing.T) {
 	shell := &Shell{}
-	shell.BeginHideWindow(" MARKER", "SENT", 2)
-	// mid-hide state with both occurrences still buffered (the live loop now
-	// consumes them in-flush, so construct the state directly)
-	shell.hideStarted = true
-	shell.hideBuf = []byte("line: SENT mid SENT end")
+	shell.BeginHideWindow(" __osc7", osc7Trigger)
+	shell.hideBuf = []byte("banner kept\r\necho:  __osc7(){ printf 'x'\r\nlater-bytes")
 	shell.hideDeadline = time.Now().Add(-time.Millisecond)
 	emit, done := shell.suppressChunk([]byte("TAIL"))
 	if !done {
 		t.Fatalf("expired window must disarm")
 	}
 	got := string(emit)
-	if strings.Contains(got, "SENT") {
-		t.Errorf("sentinel leaked on expiry: %q", got)
+	if strings.Contains(got, "__osc7") {
+		t.Errorf("echoed hook line leaked on expiry: %q", got)
 	}
-	if !strings.Contains(got, "TAIL") {
-		t.Errorf("post-expiry bytes missing: %q", got)
+	if !strings.Contains(got, "banner kept") || !strings.Contains(got, "later-bytes") || !strings.Contains(got, "TAIL") {
+		t.Errorf("bytes around the dropped line must survive: %q", got)
 	}
 }
 
-// ---- OSC 7 close mode (cmd / PowerShell, ConPTY) ----
-//
-// The live failure this mode fixes: ConPTY repaints re-deliver the echoed
-// hook line, and a text sentinel in that copy would close the window early —
-// after which the delayed REAL output leaks onto the screen glued to the
-// user's first keystrokes. Fixtures below replay the byte choreography
-// captured from the real local sshd (see scripts/freeze-repro.mjs).
+// ---- the two live regressions this design exists for ----
 
+// ConPTY repaints re-deliver the echoed hook line; under the old text-sentinel
+// semantics the copy's sentinel closed the window early and the delayed real
+// output leaked glued to the user's first keystrokes. Repaint copies must now
+// simply be dropped and the window must stay open until the LIVE OSC 7.
 func TestHideWindowOsc7RepaintCopyKeepsWindowOpen(t *testing.T) {
 	shell := &Shell{}
 	snippet := ` PROMPT $E]7;file:///$P$E\gordo@MILII $P$G`
-	shell.BeginHideWindow(snippet[:16], osc7Trigger, 1)
+	shell.BeginHideWindow(snippet[:16], osc7Trigger)
 
 	// the captured timeline: banner; tty echo of the hook line (cmd has NOT
 	// executed it yet); a ConPTY repaint carrying a COPY of the echoed line;
@@ -186,7 +196,7 @@ func TestHideWindowOsc7RepaintCopyKeepsWindowOpen(t *testing.T) {
 		"gordo@MILII C:\\Users\\gordo>" + snippet + "\r\n",
 		"\x1b[?25l" + snippet + "\x1b[6;1H", // repaint copy — must NOT close
 		"echo ZZMARK7\r",                    // user typing into the void
-		"\x1b[7;1H\x1b]7;file:///C:\\Users\\gordo\x1b\\gordo@MILII C:\\Users\\gordo>",
+		"\x1b[7;1H" + testOsc7 + "/C:\\Users\\gordo\x1b\\gordo@MILII C:\\Users\\gordo>",
 	})
 	if !strings.Contains(got, "Microsoft Windows") {
 		t.Errorf("banner was eaten: %q", got)
@@ -197,53 +207,40 @@ func TestHideWindowOsc7RepaintCopyKeepsWindowOpen(t *testing.T) {
 	if !strings.Contains(got, "echo ZZMARK7") {
 		t.Errorf("user keystrokes held past the close: %q", got)
 	}
-	if !strings.Contains(got, "\x1b]7;file:///C:\\Users\\gordo") {
-		t.Errorf("live OSC 7 must be emitted — the follow feature listens for it: %q", got)
+	if !strings.Contains(got, testOsc7+"/C:\\Users\\gordo") {
+		t.Errorf("live OSC 7 must be emitted: %q", got)
 	}
 	if !strings.Contains(got, "gordo@MILII C:\\Users\\gordo>") {
 		t.Errorf("prompt missing after close: %q", got)
 	}
 }
 
-// the trigger sequence itself is the payload the UI needs — closing must
-// emit it, not swallow it; and everything AFTER it flows verbatim
-func TestHideWindowOsc7EmitsTriggerAndTail(t *testing.T) {
+// the POSIX freeze (live: four bash tabs, server-side bash healthy in
+// n_tty_read while the client swallowed the prompt): a readline re-render
+// re-delivering the echoed line must neither close the window early nor hold
+// the user's input; even a shell that NEVER renders OSC 7 only delays its own
+// prompt line by the idle window — typing still echoes live
+func TestHideWindowPosixRedrawCopyAndNoOsc7(t *testing.T) {
 	shell := &Shell{}
-	shell.BeginHideWindow(" PROMPT $E]7;fil", osc7Trigger, 1)
-	emit, done := shell.suppressChunk([]byte(
-		"ECHO:  PROMPT $E]7;file:///$P$E\\gordo $P$G\r\n" + osc7Trigger + "/F:/x\x1b\\AFTER"))
-	if !done {
-		t.Fatalf("window must close on the first live OSC 7, emit=%q", emit)
-	}
-	got := string(emit)
-	if strings.Contains(got, "PROMPT $E") {
-		t.Errorf("echo line leaked: %q", got)
-	}
-	if !strings.Contains(got, osc7Trigger+"/F:/x") {
-		t.Errorf("trigger bytes must be emitted verbatim: %q", got)
-	}
-	if !strings.Contains(got, "AFTER") {
-		t.Errorf("post-trigger bytes missing: %q", got)
-	}
-}
+	snippet := ` __osc7(){ printf '\033]7;file://%s\033\134' "$PWD"; };PROMPT_COMMAND="__osc7"`
+	shell.BeginHideWindow(snippet[:16], osc7Trigger)
 
-// a shell that never renders the live sequence (hook failed, exotic prompt)
-// must still not blurt the echoed hook line when the idle window expires
-func TestHideWindowOsc7ExpiryDropsEchoLine(t *testing.T) {
-	shell := &Shell{}
-	shell.BeginHideWindow(" PROMPT $E", osc7Trigger, 1)
-	shell.hideStarted = true
-	shell.hideBuf = []byte("banner kept\r\ngordo> PROMPT $E]7;file:///$P$E\\x\r\nlater-bytes")
-	shell.hideDeadline = time.Now().Add(-time.Millisecond)
-	emit, done := shell.suppressChunk([]byte("TAIL"))
-	if !done {
-		t.Fatalf("expired window must disarm")
+	// MOTD, the echoed injection line at 80 cols, a readline full-line
+	// re-render (same bytes again), then the user typing while bash has not
+	// yet produced any prompt the client would show
+	got := feed(t, shell, []string{
+		"Welcome to Ubuntu 22.04\r\n",
+		"root@srv:~# " + snippet + "\r\n",
+		"\rroot@srv:~# " + snippet + "\x1b[K", // readline redraw copy
+		"echo ZZMARK7\r\n",
+	})
+	if !strings.Contains(got, "Welcome to Ubuntu") {
+		t.Errorf("MOTD was eaten: %q", got)
 	}
-	got := string(emit)
-	if strings.Contains(got, "PROMPT $E") {
-		t.Errorf("echoed hook line leaked on expiry: %q", got)
+	if strings.Contains(got, "__osc7") {
+		t.Errorf("injection echo (or redraw copy) leaked: %q", got)
 	}
-	if !strings.Contains(got, "banner kept") || !strings.Contains(got, "later-bytes") || !strings.Contains(got, "TAIL") {
-		t.Errorf("bytes around the dropped line must survive: %q", got)
+	if !strings.Contains(got, "echo ZZMARK7") {
+		t.Errorf("user keystrokes must flow live while the window is open: %q", got)
 	}
 }
