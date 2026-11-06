@@ -288,7 +288,7 @@ func TestHideWindowWrappedEchoContinuation(t *testing.T) {
 		return out
 	}
 	folded := fold(line, 80)
-	kept, tail, done := filterOsc7Regions(folded, markers, trigger, false)
+	kept, tail, done := filterOsc7Regions(folded, markers, markerFragments(markers), trigger, false)
 	if done {
 		t.Fatal("window closed on folded echo (no trigger present)")
 	}
@@ -301,7 +301,7 @@ func TestHideWindowWrappedEchoContinuation(t *testing.T) {
 
 	// the user's keystrokes right behind the folded echo still flow live
 	typed := []byte("ls -l\r\n")
-	kept2, _, _ := filterOsc7Regions(typed, markers, trigger, false)
+	kept2, _, _ := filterOsc7Regions(typed, markers, markerFragments(markers), trigger, false)
 	if string(kept2) != string(typed) {
 		t.Fatalf("user keystrokes swallowed after wrapped echo: %q", kept2)
 	}

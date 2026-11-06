@@ -449,7 +449,22 @@ func (manager *Manager) conn(connectionID string, emitter *dbxpluginsdk.Emitter,
 // dial opens one PTY session over the connection's shared client. The shell
 // reports its own death to the reconnect supervisor — PTY EOF is usually the
 // first symptom of a dropped link.
+//
+// The PTY is born WIDE (wideShellCols) regardless of the requested size:
+// the follow-hook echo must not hard-wrap at the tty width — a wrapped echo
+// gets chopped into separate paint regions (the tty folds with a bare CR on
+// old line disciplines) and readline's redraw of the wrapped line emits
+// byte sequences that no longer match the injected text verbatim (CentOS 7
+// bash 4.2 field repro: fragments like `};PROMPT_COMMAND="_` leaking). With
+// an unwrapped echo the whole hook line is one region and dies on the head
+// marker; the UI's fit-resize narrows the PTY right after, once the shell's
+// line editor no longer holds the injection line.
+const wideShellCols = 500
+
 func (manager *Manager) dial(conn *Conn, cols, rows int, emitter *dbxpluginsdk.Emitter) (string, error) {
+	if cols < wideShellCols {
+		cols = wideShellCols
+	}
 	onClosed := func(*Shell) { manager.notifyConnectionTrouble(conn.Spec.ConnectionID) }
 	shell, err := ConnectShell(conn.Client(), conn.Spec, cols, rows, emitter, onClosed)
 	if err != nil {

@@ -52,6 +52,7 @@ type Shell struct {
 	// the marker flows with at most that sub-millisecond delay.
 	suppressMutex sync.Mutex
 	hideStart     [][]byte
+	hideFrags     [][]byte
 	hideEnd       []byte
 	hideDeadline  time.Time
 	hideBuf       []byte
@@ -100,9 +101,35 @@ func (shell *Shell) BeginHideWindow(startMarkers []string, endMarker string) {
 	for _, marker := range startMarkers {
 		shell.hideStart = append(shell.hideStart, []byte(marker))
 	}
+	// pre-expand every marker line into overlapping fragments: readline's
+	// redraw of a wrapped echo emits byte sequences that are NOT verbatim
+	// substrings of the injected text (spliced runs like `};PROMPT_COMMAND="_`),
+	// but each visual run still carries a contiguous stretch of the original —
+	// any fragment hit classifies the region as injection residue.
+	shell.hideFrags = markerFragments(shell.hideStart)
 	shell.hideEnd = []byte(endMarker)
 	shell.hideDeadline = time.Now().Add(hideIdleWindow)
 	shell.hideBuf = nil
+}
+
+// markerFragments slides a window over each marker line, producing every
+// contiguous fragment of fragLen bytes (step fragLen/2, so no boundary split
+// can dodge all of them). Lines shorter than the window fall back to the
+// whole line.
+const fragmentLen = 12
+
+func markerFragments(lines [][]byte) [][]byte {
+	var frags [][]byte
+	for _, line := range lines {
+		if len(line) <= fragmentLen {
+			frags = append(frags, line)
+			continue
+		}
+		for at := 0; at+fragmentLen <= len(line); at += fragmentLen / 2 {
+			frags = append(frags, line[at:at+fragmentLen])
+		}
+	}
+	return frags
 }
 
 // firstPaintBoundaryEnd returns the index just past the first control that
@@ -150,7 +177,7 @@ func firstPaintBoundaryEnd(buf []byte) int {
 // decided now (dropped only if it holds a marker) instead of being held for
 // more bytes. Returns the bytes to emit, the unconsumed tail (only when
 // !done), done.
-func filterOsc7Regions(buf []byte, markers [][]byte, trigger []byte, final bool) (kept, tail []byte, done bool) {
+func filterOsc7Regions(buf []byte, markers, frags [][]byte, trigger []byte, final bool) (kept, tail []byte, done bool) {
 	kept = make([]byte, 0, len(buf))
 	pos := 0
 	for pos < len(buf) {
@@ -168,14 +195,14 @@ func filterOsc7Regions(buf []byte, markers [][]byte, trigger []byte, final bool)
 		if at := bytes.Index(region, trigger); at >= 0 {
 			// the live trigger: emit its region (dropping any marker bytes
 			// glued ahead of it in the same region) plus everything after it
-			if containsAny(region, markers) {
+			if hideMatches(region[:at], markers, frags) {
 				kept = append(kept, region[at:]...)
 			} else {
 				kept = append(kept, region...)
 			}
 			return kept, nil, true
 		}
-		if !hideMatches(region, markers) {
+		if !hideMatches(region, markers, frags) {
 			kept = append(kept, region...)
 			pos = end
 		} else if region[len(region)-1] == '\r' && end < len(buf) && buf[end] == '\n' {
@@ -188,7 +215,7 @@ func filterOsc7Regions(buf []byte, markers [][]byte, trigger []byte, final bool)
 	}
 	tail = buf[pos:]
 	if at := bytes.Index(tail, trigger); at >= 0 {
-		if hideMatches(tail[:at], markers) {
+		if hideMatches(tail[:at], markers, frags) {
 			kept = append(kept, tail[at:]...)
 		} else {
 			kept = append(kept, tail...)
@@ -196,7 +223,7 @@ func filterOsc7Regions(buf []byte, markers [][]byte, trigger []byte, final bool)
 		return kept, nil, true
 	}
 	if final {
-		if !hideMatches(tail, markers) {
+		if !hideMatches(tail, markers, frags) {
 			kept = append(kept, tail...)
 		}
 		return kept, nil, true
@@ -229,7 +256,7 @@ func containsAny(region []byte, markers [][]byte) bool {
 // never be mistaken for injection residue. The window only spans the first
 // seconds of a fresh session, so real output colliding with these specific
 // command texts is not a practical concern.
-func hideMatches(region []byte, lines [][]byte) bool {
+func hideMatches(region []byte, lines, frags [][]byte) bool {
 	for _, line := range lines {
 		if len(line) == 0 {
 			continue
@@ -245,6 +272,11 @@ func hideMatches(region []byte, lines [][]byte) bool {
 		if len(content) >= 8 && bytes.Contains(line, content) {
 			return true
 		}
+	}
+	// the fragment set catches readline-redraw splices: runs that are not
+	// verbatim substrings still carry contiguous stretches of the original
+	if containsAny(region, frags) {
+		return true
 	}
 	return false
 }
@@ -292,14 +324,14 @@ func (shell *Shell) suppressChunk(chunk []byte) (emit []byte, done bool) {
 	if time.Now().After(shell.hideDeadline) {
 		// idle for the whole window: decide everything now (marker regions
 		// still dropped, so expiring does not UNDO the hiding) and disarm
-		held, _, _ := filterOsc7Regions(shell.hideBuf, shell.hideStart, shell.hideEnd, true)
+		held, _, _ := filterOsc7Regions(shell.hideBuf, shell.hideStart, shell.hideFrags, shell.hideEnd, true)
 		shell.hideStart = nil
 		shell.hideEnd = nil
 		shell.hideBuf = nil
 		return append(held, chunk...), true
 	}
 	shell.hideBuf = append(shell.hideBuf, chunk...)
-	kept, rest, closed := filterOsc7Regions(shell.hideBuf, shell.hideStart, shell.hideEnd, false)
+	kept, rest, closed := filterOsc7Regions(shell.hideBuf, shell.hideStart, shell.hideFrags, shell.hideEnd, false)
 	if closed {
 		shell.hideStart = nil
 		shell.hideEnd = nil
@@ -315,7 +347,7 @@ func (shell *Shell) suppressChunk(chunk []byte) (emit []byte, done bool) {
 		shell.hideStart = nil
 		shell.hideEnd = nil
 		shell.hideBuf = nil
-		out, _, _ := filterOsc7Regions(held, marker, end, true)
+		out, _, _ := filterOsc7Regions(held, marker, markerFragments(marker), end, true)
 		return append(kept, out...), true
 	}
 	return kept, false
