@@ -259,3 +259,50 @@ func TestHideWindowPosixRedrawCopyAndNoOsc7(t *testing.T) {
 		t.Errorf("user keystrokes must flow live while the window is open: %q", got)
 	}
 }
+
+// TestHideWindowWrappedEchoContinuation: the tty driver hard-wraps an echo
+// longer than the PTY width by inserting CRLF mid-line; the region walker
+// sees the wrapped chunks as separate regions, and the continuation chunks
+// carry no line-start bytes. Field repro (10.20.152.209 / 10.20.43.134):
+// only the head chunk was dropped, the wrapped tail ("istory -r; }history
+// -c;h") leaked onto the screen. With full-line markers and fragment
+// matching every chunk dies while the user's own keystrokes still flow.
+func TestHideWindowWrappedEchoContinuation(t *testing.T) {
+	line := []byte(` PROMPT_COMMAND="__osc7; printf '\033]7;file://%s\033\\' \"$PWD\";${PROMPT_COMMAND:+;$PROMPT_COMMAND}\";[ -n \"$HISTFILE\" ]&&{ history -c;history -r; }`)
+	markers := [][]byte{line}
+	trigger := []byte("\x1b]7;file://")
+
+	// the echo comes back folded at 80 columns: CRLF inserted mid-line
+	fold := func(src []byte, width int) []byte {
+		out := make([]byte, 0, len(src)+16)
+		col := 0
+		for _, b := range src {
+			if col == width {
+				out = append(out, '\r', '\n')
+				col = 0
+			}
+			out = append(out, b)
+			col++
+		}
+		out = append(out, '\r', '\n')
+		return out
+	}
+	folded := fold(line, 80)
+	kept, tail, done := filterOsc7Regions(folded, markers, trigger, false)
+	if done {
+		t.Fatal("window closed on folded echo (no trigger present)")
+	}
+	if len(kept) != 0 {
+		t.Fatalf("wrapped echo leaked %d bytes: %q", len(kept), kept)
+	}
+	if len(tail) != 0 {
+		t.Fatalf("incomplete region held back unexpectedly: %q", tail)
+	}
+
+	// the user's keystrokes right behind the folded echo still flow live
+	typed := []byte("ls -l\r\n")
+	kept2, _, _ := filterOsc7Regions(typed, markers, trigger, false)
+	if string(kept2) != string(typed) {
+		t.Fatalf("user keystrokes swallowed after wrapped echo: %q", kept2)
+	}
+}

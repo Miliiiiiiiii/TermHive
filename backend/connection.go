@@ -504,18 +504,18 @@ func (manager *Manager) injectFollowHook(conn *Conn, shell *Shell) {
 		return
 	}
 	if conn.Spec.StartupCmd == "" {
-		// hide the echo of every line we type (a distinctive prefix of EACH
-		// snippet line — the bash/zsh history-hygiene preset line included)
-		// until the first LIVE OSC 7 report proves the hook took effect. One
-		// mechanism for every shell family: the trigger is real escape bytes
-		// that no echo/redraw copy of the injected lines can carry, and the
-		// rolling filter never holds the user's own keystrokes — the shell
-		// kind only shapes the snippet itself
+		// hide the echo of every line we type (each FULL snippet line as the
+		// marker — the bash/zsh history-hygiene tail included) until the first
+		// LIVE OSC 7 report proves the hook took effect. One mechanism for
+		// every shell family: the trigger is real escape bytes that no
+		// echo/redraw copy of the injected lines can carry, and the rolling
+		// filter never holds the user's own keystrokes — the shell kind only
+		// shapes the snippet itself. Full lines (not head prefixes) are the
+		// markers because the tty driver hard-wraps a long echo at the PTY
+		// width; the wrapped continuation carries no line-start bytes, so the
+		// filter needs to recognize fragments OF a line as well.
 		var markers []string
 		for _, line := range strings.Split(snippet, "\n") {
-			if len(line) > 16 {
-				line = line[:16]
-			}
 			if strings.TrimSpace(line) != "" {
 				markers = append(markers, line)
 			}

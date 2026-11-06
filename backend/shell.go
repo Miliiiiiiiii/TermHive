@@ -175,7 +175,7 @@ func filterOsc7Regions(buf []byte, markers [][]byte, trigger []byte, final bool)
 			}
 			return kept, nil, true
 		}
-		if !containsAny(region, markers) {
+		if !hideMatches(region, markers) {
 			kept = append(kept, region...)
 			pos = end
 		} else if region[len(region)-1] == '\r' && end < len(buf) && buf[end] == '\n' {
@@ -188,7 +188,7 @@ func filterOsc7Regions(buf []byte, markers [][]byte, trigger []byte, final bool)
 	}
 	tail = buf[pos:]
 	if at := bytes.Index(tail, trigger); at >= 0 {
-		if containsAny(tail[:at], markers) {
+		if hideMatches(tail[:at], markers) {
 			kept = append(kept, tail[at:]...)
 		} else {
 			kept = append(kept, tail...)
@@ -196,7 +196,7 @@ func filterOsc7Regions(buf []byte, markers [][]byte, trigger []byte, final bool)
 		return kept, nil, true
 	}
 	if final {
-		if !containsAny(tail, markers) {
+		if !hideMatches(tail, markers) {
 			kept = append(kept, tail...)
 		}
 		return kept, nil, true
@@ -205,6 +205,8 @@ func filterOsc7Regions(buf []byte, markers [][]byte, trigger []byte, final bool)
 }
 
 // containsAny reports whether the region carries any of the hook markers.
+// Kept for the trigger-glue checks; region classification goes through
+// hideMatches below.
 func containsAny(region []byte, markers [][]byte) bool {
 	for _, marker := range markers {
 		if bytes.Contains(region, marker) {
@@ -212,6 +214,65 @@ func containsAny(region []byte, markers [][]byte) bool {
 		}
 	}
 	return false
+}
+
+// hideMatches classifies one paint region against the injected hook lines.
+// Two shapes must match:
+//   - a redraw/echo copy CARRIES a line (or its distinctive head), and
+//   - a hard-wrapped CONTINUATION of a line carries no line-start bytes at
+//     all: the tty driver folds an echo longer than the PTY width by emitting
+//     CRLF mid-line, which the region walker treats as a line end — the tail
+//     fragment then has to be recognized as a fragment OF one of the lines.
+//
+// Fragment matching requires substance (≥8 content bytes after trimming the
+// trailing CRLF/CSI boundary) so a user keystroke or stray short region can
+// never be mistaken for injection residue. The window only spans the first
+// seconds of a fresh session, so real output colliding with these specific
+// command texts is not a practical concern.
+func hideMatches(region []byte, lines [][]byte) bool {
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		head := line
+		if len(head) > 16 {
+			head = head[:16]
+		}
+		if bytes.Contains(region, head) {
+			return true
+		}
+		content := trimRegionBoundary(region)
+		if len(content) >= 8 && bytes.Contains(line, content) {
+			return true
+		}
+	}
+	return false
+}
+
+// trimRegionBoundary strips the region's terminating CRLF and/or one trailing
+// CSI sequence (EL/CUP paint boundary) so the remaining content can be
+// matched as a plain substring of an injected line.
+func trimRegionBoundary(region []byte) []byte {
+	content := region
+	for len(content) > 0 && (content[len(content)-1] == '\n' || content[len(content)-1] == '\r') {
+		content = content[:len(content)-1]
+	}
+	if at := bytes.LastIndex(content, []byte("\x1b[")); at >= 0 {
+		rest := content[at+2:]
+		if len(rest) > 0 {
+			isBoundary := true
+			for _, b := range rest {
+				if !(b == ';' || (b >= '0' && b <= '9') || b == 'K' || b == 'H' || b == 'F') {
+					isBoundary = false
+					break
+				}
+			}
+			if isBoundary {
+				content = content[:at]
+			}
+		}
+	}
+	return content
 }
 
 // suppressChunk runs one flush through the hiding window. It returns the
