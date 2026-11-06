@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -185,4 +186,114 @@ func (manager *Manager) applySessionLogSetting() {
 			manager.detachSessionLog(shell)
 		}
 	}
+}
+
+// ---- retention: age + total-size pruning ----
+//
+// The per-session cap stops one runaway log but nothing bounds the COUNT of
+// logs; a long-lived data dir grows forever. Pruning keeps files for
+// sessionLogMaxAgeDays (0 = forever) and, if the total still exceeds
+// sessionLogMaxTotalMB (0 = unlimited), deletes oldest-first until it fits.
+// Live sinks are skipped explicitly (POSIX would let the delete through and
+// orphan an open handle; Windows would just fail the remove).
+
+// sessionLogMaxAgeDays reads the retention setting (default 30, 0 = forever).
+func (manager *Manager) sessionLogMaxAgeDays() int {
+	manager.mutex.Lock()
+	defer manager.mutex.Unlock()
+	if value, ok := manager.settings["sessionLogMaxAgeDays"].(float64); ok {
+		days := int(value)
+		if days < 0 {
+			return 0
+		}
+		return days
+	}
+	return 30
+}
+
+// sessionLogMaxTotalMB reads the total-size budget (default 500, 0 = unlimited).
+func (manager *Manager) sessionLogMaxTotalMB() int {
+	manager.mutex.Lock()
+	defer manager.mutex.Unlock()
+	if value, ok := manager.settings["sessionLogMaxTotalMB"].(float64); ok {
+		mb := int(value)
+		if mb < 0 {
+			return 0
+		}
+		return mb
+	}
+	return 500
+}
+
+// pruneSessionLogs applies the retention policy once. Errors are logged to
+// diag and never propagate — pruning must not disturb anything live.
+func (manager *Manager) pruneSessionLogs() {
+	if manager.dataDir == "" {
+		return
+	}
+	maxAgeDays := manager.sessionLogMaxAgeDays()
+	maxTotalBytes := int64(manager.sessionLogMaxTotalMB()) * 1024 * 1024
+	livePaths := make(map[string]bool)
+	manager.mutex.Lock()
+	for _, shell := range manager.shells {
+		if sink := shell.logSink.Load(); sink != nil {
+			livePaths[sink.path] = true
+		}
+	}
+	manager.mutex.Unlock()
+
+	type logFile struct {
+		path    string
+		modTime time.Time
+		size    int64
+	}
+	var files []logFile
+	var total int64
+	logsRoot := filepath.Join(manager.dataDir, "logs")
+	_ = filepath.Walk(logsRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".log") {
+			return nil
+		}
+		if livePaths[path] {
+			return nil // an open sink owns it
+		}
+		files = append(files, logFile{path: path, modTime: info.ModTime(), size: info.Size()})
+		total += info.Size()
+		return nil
+	})
+	if len(files) == 0 {
+		return
+	}
+
+	// oldest first: age eviction and size eviction share the same order
+	sort.Slice(files, func(i, j int) bool { return files[i].modTime.Before(files[j].modTime) })
+	now := time.Now()
+	removed := 0
+	for i := range files {
+		expired := maxAgeDays > 0 && now.Sub(files[i].modTime) > time.Duration(maxAgeDays)*24*time.Hour
+		overBudget := maxTotalBytes > 0 && total > maxTotalBytes
+		if !expired && !overBudget {
+			continue
+		}
+		if os.Remove(files[i].path) == nil {
+			total -= files[i].size
+			removed++
+		}
+	}
+	if removed > 0 {
+		manager.writeDiag(fmt.Sprintf("会话日志清理: 删除 %d 个过期/超量文件", removed))
+	}
+}
+
+// startSessionLogPruner runs the retention pass at startup and then hourly —
+// a long-lived sidecar must not wait for a restart to honor new settings.
+func (manager *Manager) startSessionLogPruner() {
+	go func() {
+		manager.pruneSessionLogs()
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			manager.pruneSessionLogs()
+		}
+	}()
 }

@@ -164,6 +164,13 @@ func (app *plugin) handle(
 		}
 		return sample, nil
 
+	case "monitor/kill":
+		if pluginError := app.manager.MonitorKill(
+			str(values["connectionId"]), intOf(values["pid"]), values["force"] == true, emitter); pluginError != nil {
+			return nil, pluginError
+		}
+		return map[string]any{"ok": true}, nil
+
 	case "workspace/get":
 		return map[string]any{"workspace": app.manager.GetWorkspace()}, nil
 
@@ -295,7 +302,7 @@ func (app *plugin) handle(
 	// ---- in-app remote file editor ----
 
 	case "fs/read":
-		result, err := app.manager.ReadRemoteFile(str(values["shellId"]), str(values["path"]), int64Of(values["offset"]))
+		result, err := app.manager.ReadRemoteFile(str(values["shellId"]), str(values["path"]), int64Of(values["offset"]), str(values["encoding"]))
 		if err != nil {
 			return nil, dbxpluginsdk.NewError(-32006, err.Error())
 		}
@@ -303,7 +310,7 @@ func (app *plugin) handle(
 
 	case "fs/write":
 		if err := app.manager.WriteRemoteFile(
-			str(values["shellId"]), str(values["path"]), str(values["contentBase64"]),
+			str(values["shellId"]), str(values["path"]), str(values["contentBase64"]), str(values["encoding"]),
 		); err != nil {
 			return nil, dbxpluginsdk.NewError(-32006, err.Error())
 		}

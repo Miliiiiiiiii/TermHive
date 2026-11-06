@@ -6,7 +6,7 @@
 import { bridge, hasFloating } from "../host";
 import { icon } from "../icon";
 import { t } from "../i18n";
-import { notify } from "../notify";
+import { notify, confirmBox } from "../notify";
 import { createTerminal, type TerminalHandle } from "../term";
 import { createFilePanel, type FilePanel } from "../filepanel";
 import { Highlighter } from "../highlight";
@@ -1566,9 +1566,22 @@ export async function mountSession(context: SessionContext): Promise<() => void>
   // One exec round trip per sample on the focused tab's connection; the CPU
   // sparkline keeps the last 60 samples (≈5 min at the 5s poll).
   interface MonitorDisk { mount: string; totalKb: number; usedKb: number; usePct: number }
-  interface MonitorSample { os: string; cpu: number; memTotal: number; memUsed: number; disks: MonitorDisk[] }
+  interface MonitorGpu { name: string; utilPct: number; memUsedMb: number; memTotalMb: number }
+  interface MonitorProc { user: string; pid: number; cpuPct: number; memPct: number; command: string }
+  interface MonitorSample {
+    os: string;
+    cpu: number;
+    memTotal: number;
+    memUsed: number;
+    disks: MonitorDisk[];
+    netRxKbps?: number;
+    netTxKbps?: number;
+    gpus?: MonitorGpu[];
+    procs?: MonitorProc[];
+  }
   let monitorTimer = 0;
   const cpuHistory: number[] = [];
+  const netHistory: number[] = [];
 
   function humanKib(kib: number): string {
     if (!kib) return "0";
@@ -1588,6 +1601,29 @@ export async function mountSession(context: SessionContext): Promise<() => void>
     return wrap;
   }
 
+  function rateText(kbps: number): string {
+    if (kbps >= 1024) return `${(kbps / 1024).toFixed(1)} MB/s`;
+    if (kbps >= 1) return `${kbps.toFixed(0)} KB/s`;
+    return `${(kbps * 1024).toFixed(0)} B/s`;
+  }
+  function drawSpark(canvas: HTMLCanvasElement, values: number[], ceiling: number, color: string): void {
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    const points = values.slice(-60);
+    points.forEach((value, index) => {
+      const x = (index / 59) * w;
+      const y = h - (Math.min(ceiling, Math.max(0, value)) / ceiling) * (h - 2) - 1;
+      if (index === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
   function drawCpuSpark(canvas: HTMLCanvasElement): void {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
@@ -1658,6 +1694,84 @@ export async function mountSession(context: SessionContext): Promise<() => void>
         diskRow.querySelector<HTMLElement>(".mon-value")!.textContent = `${disk.usePct}%`;
         monitorPop.append(diskRow, bar(disk.usePct));
       }
+    }
+
+    // network: combined rate line + sparkline of the total (rx+tx)
+    if (typeof sample.netRxKbps === "number") {
+      const total = (sample.netRxKbps || 0) + (sample.netTxKbps || 0);
+      netHistory.push(total);
+      if (netHistory.length > 60) netHistory.shift();
+      const netCeiling = Math.max(10, ...netHistory);
+      const netRow = document.createElement("div");
+      netRow.className = "mon-row";
+      netRow.innerHTML = `<span class="mon-label"></span><span class="mon-value"></span>`;
+      netRow.querySelector<HTMLElement>(".mon-label")!.textContent = t("monitorNet");
+      netRow.querySelector<HTMLElement>(".mon-value")!.textContent =
+        `↓ ${rateText(sample.netRxKbps || 0)} · ↑ ${rateText(sample.netTxKbps || 0)}`;
+      const netSpark = document.createElement("canvas");
+      netSpark.className = "mon-spark";
+      netSpark.width = 240;
+      netSpark.height = 30;
+      netRow.append(netSpark);
+      monitorPop.append(netRow);
+      drawSpark(netSpark, netHistory, netCeiling, "#60a5fa");
+    }
+
+    // GPUs (only when nvidia-smi answered)
+    if (Array.isArray(sample.gpus) && sample.gpus.length > 0) {
+      const gpuHead = document.createElement("div");
+      gpuHead.className = "mon-row mon-disk-head";
+      const headLabel = document.createElement("span");
+      headLabel.className = "mon-label";
+      headLabel.textContent = t("monitorGpu");
+      gpuHead.append(headLabel);
+      monitorPop.append(gpuHead);
+      for (const gpu of sample.gpus) {
+        const gpuRow = document.createElement("div");
+        gpuRow.className = "mon-row mon-disk";
+        gpuRow.innerHTML = `<span class="mon-label" title=""></span><span class="mon-value"></span>`;
+        const labelEl = gpuRow.querySelector<HTMLElement>(".mon-label")!;
+        labelEl.textContent = gpu.name;
+        labelEl.title = `${gpu.memUsedMb.toFixed(0)} / ${gpu.memTotalMb.toFixed(0)} MB`;
+        gpuRow.querySelector<HTMLElement>(".mon-value")!.textContent = `${gpu.utilPct.toFixed(0)}%`;
+        monitorPop.append(gpuRow, bar(gpu.utilPct));
+      }
+    }
+
+    // top processes with kill
+    if (Array.isArray(sample.procs) && sample.procs.length > 0) {
+      const procHead = document.createElement("div");
+      procHead.className = "mon-row mon-disk-head";
+      const headLabel = document.createElement("span");
+      headLabel.className = "mon-label";
+      headLabel.textContent = t("monitorProcs");
+      procHead.append(headLabel);
+      monitorPop.append(procHead);
+      const procBox = document.createElement("div");
+      procBox.className = "mon-procs";
+      for (const proc of sample.procs) {
+        const row = document.createElement("div");
+        row.className = "mon-proc";
+        row.innerHTML = `<span class="mp-pid"></span><span class="mp-stats"></span><span class="mp-cmd" title=""></span><button class="mp-kill" title="${t("monitorKill")}">✕</button>`;
+        row.querySelector<HTMLElement>(".mp-pid")!.textContent = String(proc.pid);
+        row.querySelector<HTMLElement>(".mp-stats")!.textContent = `${proc.cpuPct.toFixed(1)}% · ${proc.memPct.toFixed(1)}% · ${proc.user}`;
+        const cmdEl = row.querySelector<HTMLElement>(".mp-cmd")!;
+        cmdEl.textContent = proc.command;
+        cmdEl.title = proc.command;
+        row.querySelector<HTMLElement>(".mp-kill")!.addEventListener("click", async () => {
+          const sure = await confirmBox(`${t("monitorKill")} PID ${proc.pid} (${proc.command.slice(0, 40)})?`);
+          if (!sure) return;
+          try {
+            const target = tabs[activeIndex()]?.connectionId || connectionId;
+            await api("monitor/kill", { connectionId: target, pid: proc.pid }, 30000);
+            void sampleMonitor();
+          } catch (error: any) {
+            notify(error.message);
+          }
+        });
+        procBox.append(row);
+      }
+      monitorPop.append(procBox);
     }
     drawCpuSpark(spark);
   }

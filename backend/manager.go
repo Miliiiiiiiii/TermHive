@@ -132,6 +132,7 @@ func NewManager(dataDir string) *Manager {
 		_ = os.MkdirAll(dataDir, 0o700)
 		manager.loadSpecs()
 		manager.loadSettings()
+		manager.startSessionLogPruner()
 	}
 	return manager
 }

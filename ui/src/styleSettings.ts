@@ -27,6 +27,9 @@ export interface StyleSettings {
   /** give up auto-reconnect after this many failed redials (backend clamps 1..500) */
   autoReconnectMaxAttempts: number;
   sessionLog: boolean;
+  /** session-log retention: age in days (0 = forever) and total budget in MB (0 = unlimited) */
+  sessionLogMaxAgeDays: number;
+  sessionLogMaxTotalMB: number;
   /** auto-remove finished transfer queue rows after this many seconds */
   transferAutoClose: boolean;
   transferAutoCloseDelay: number;
@@ -51,6 +54,8 @@ export function defaultStyleSettings(): StyleSettings {
     autoReconnect: true,
     autoReconnectMaxAttempts: 20,
     sessionLog: false,
+    sessionLogMaxAgeDays: 30,
+    sessionLogMaxTotalMB: 500,
     transferAutoClose: true,
     transferAutoCloseDelay: 3,
     disableShellIntegration: false,
@@ -68,6 +73,8 @@ type StoredSettings = {
   autoReconnect?: boolean;
   autoReconnectMaxAttempts?: number;
   sessionLog?: boolean;
+  sessionLogMaxAgeDays?: number;
+  sessionLogMaxTotalMB?: number;
   transferAutoClose?: boolean;
   transferAutoCloseDelay?: number;
   disableShellIntegration?: boolean;
@@ -100,6 +107,12 @@ function applyStored(settings: StyleSettings, stored: StoredSettings): void {
     );
   }
   if (typeof stored.sessionLog === "boolean") settings.sessionLog = stored.sessionLog;
+  if (typeof stored.sessionLogMaxAgeDays === "number" && Number.isFinite(stored.sessionLogMaxAgeDays)) {
+    settings.sessionLogMaxAgeDays = Math.min(3650, Math.max(0, Math.round(stored.sessionLogMaxAgeDays)));
+  }
+  if (typeof stored.sessionLogMaxTotalMB === "number" && Number.isFinite(stored.sessionLogMaxTotalMB)) {
+    settings.sessionLogMaxTotalMB = Math.min(102400, Math.max(0, Math.round(stored.sessionLogMaxTotalMB)));
+  }
   if (typeof stored.transferAutoClose === "boolean") settings.transferAutoClose = stored.transferAutoClose;
   if (typeof stored.transferAutoCloseDelay === "number" && Number.isFinite(stored.transferAutoCloseDelay)) {
     settings.transferAutoCloseDelay = Math.min(3600, Math.max(0, Math.round(stored.transferAutoCloseDelay)));
@@ -157,6 +170,8 @@ export function saveStyleSettings(settings: StyleSettings): void {
           autoReconnect: settings.autoReconnect,
           autoReconnectMaxAttempts: settings.autoReconnectMaxAttempts,
           sessionLog: settings.sessionLog,
+          sessionLogMaxAgeDays: settings.sessionLogMaxAgeDays,
+          sessionLogMaxTotalMB: settings.sessionLogMaxTotalMB,
           transferAutoClose: settings.transferAutoClose,
           transferAutoCloseDelay: settings.transferAutoCloseDelay,
           disableShellIntegration: settings.disableShellIntegration,
@@ -611,11 +626,32 @@ export function renderStylePop(
     settingCard(t("transferAutoCloseLabel"), t("transferAutoCloseDesc"), null).append(ctl);
   }
 
-  settingCard(
-    t("sessionLogLabel"),
-    t("sessionLogDesc"),
-    makeSwitch(state.sessionLog, (value) => commit((draft) => (draft.sessionLog = value))),
-  );
+  {
+    const ageInput = numberInput(
+      state.sessionLogMaxAgeDays,
+      0,
+      3650,
+      t("sessionLogAgeTitle"),
+      (value) => commit((draft) => (draft.sessionLogMaxAgeDays = value)),
+    );
+    const totalInput = numberInput(
+      state.sessionLogMaxTotalMB,
+      0,
+      102400,
+      t("sessionLogTotalTitle"),
+      (value) => commit((draft) => (draft.sessionLogMaxTotalMB = value)),
+    );
+    const ctl = document.createElement("div");
+    ctl.className = "stg-ctl";
+    ctl.append(
+      makeSwitch(state.sessionLog, (value) => commit((draft) => (draft.sessionLog = value))),
+      ageInput,
+      unitSpan(t("daysUnit")),
+      totalInput,
+      unitSpan("MB"),
+    );
+    settingCard(t("sessionLogLabel"), t("sessionLogDesc"), null).append(ctl);
+  }
 
   settingCard(
     t("disableIntegrationLabel"),

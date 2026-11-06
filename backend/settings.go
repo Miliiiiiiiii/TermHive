@@ -70,6 +70,7 @@ func (manager *Manager) SetSettings(patch map[string]any) {
 	}
 	manager.emit("settings.changed", map[string]any{"settings": merged})
 	// behavior keys the backend itself reacts to (session-log sinks attach
-	// or detach on live shells)
+	// or detach on live shells; the retention pass honors new limits at once)
 	manager.applySessionLogSetting()
+	go manager.pruneSessionLogs()
 }

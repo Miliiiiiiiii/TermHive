@@ -68,7 +68,7 @@ func encodeFromUTF8(encoding string, raw []byte) ([]byte, error) {
 // to UTF-8. Files larger than editorWindowBytes are reported as windowed (the
 // UI shows them read-only with window navigation). Binary content is reported
 // instead of shipped (probed on the first window only).
-func (manager *Manager) ReadRemoteFile(shellID, path string, offset int64) (map[string]any, error) {
+func (manager *Manager) ReadRemoteFile(shellID, path string, offset int64, encodingOverride string) (map[string]any, error) {
 	fs, spec, err := manager.fsWithSpec(shellID)
 	if err != nil {
 		return nil, err
@@ -108,12 +108,16 @@ func (manager *Manager) ReadRemoteFile(shellID, path string, offset int64) (map[
 			return map[string]any{"binary": true, "size": size}, nil
 		}
 	}
-	if !utf8.Valid(raw) && strings.ToLower(spec.Encoding) == "utf-8" {
+	encoding := spec.Encoding
+	if norm := normalizeEncoding(encodingOverride); norm != "" {
+		encoding = norm
+	}
+	if !utf8.Valid(raw) && strings.ToLower(encoding) == "utf-8" {
 		// the file declares nothing; if it is not valid UTF-8 the editor would
 		// show mojibake — still load it (replace errors) so users can fix it
 		raw = []byte(strings.ToValidUTF8(string(raw), "\uFFFD"))
 	}
-	content, err := decodeToUTF8(spec.Encoding, raw)
+	content, err := decodeToUTF8(encoding, raw)
 	if err != nil {
 		return nil, err
 	}
@@ -138,15 +142,30 @@ func (manager *Manager) ReadRemoteFile(shellID, path string, offset int64) (map[
 		"offset":        offset,
 		"limit":         limit,
 		"windowed":      windowed,
-		"encoding":      spec.Encoding,
+		"encoding":      encoding,
 	}, nil
+}
+
+// normalizeEncoding maps a UI-supplied encoding choice to the canonical
+// name; anything unrecognized (including the empty "follow connection"
+// default) returns "" so the connection encoding stays in charge.
+func normalizeEncoding(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "utf-8", "utf8":
+		return "utf-8"
+	case "gbk":
+		return "gbk"
+	case "gb18030":
+		return "gb18030"
+	}
+	return ""
 }
 
 // WriteRemoteFile stores editor content (UTF-8) back: transcode to the
 // connection encoding, write a sibling temp file, then rename over the
 // target — a failed write never truncates the original. Servers without
 // rename-over fall back to a direct overwrite.
-func (manager *Manager) WriteRemoteFile(shellID, path, contentBase64 string) error {
+func (manager *Manager) WriteRemoteFile(shellID, path, contentBase64, encodingOverride string) error {
 	fs, spec, err := manager.fsWithSpec(shellID)
 	if err != nil {
 		return err
@@ -155,7 +174,11 @@ func (manager *Manager) WriteRemoteFile(shellID, path, contentBase64 string) err
 	if err != nil {
 		return err
 	}
-	encoded, err := encodeFromUTF8(spec.Encoding, raw)
+	encoding := spec.Encoding
+	if norm := normalizeEncoding(encodingOverride); norm != "" {
+		encoding = norm
+	}
+	encoded, err := encodeFromUTF8(encoding, raw)
 	if err != nil {
 		return err
 	}

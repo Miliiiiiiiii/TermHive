@@ -1005,6 +1005,12 @@ export function createFilePanel(shellId: string, startDir?: string, connectionId
           <span class="editor-title"></span>
           <span class="editor-status"></span>
           <span class="spacer"></span>
+          <select class="editor-encoding" data-act="encoding" title="${t("editorEncodingTitle")}">
+            <option value="">${t("editorEncodingAuto")}</option>
+            <option value="utf-8">UTF-8</option>
+            <option value="gbk">GBK</option>
+            <option value="gb18030">GB18030</option>
+          </select>
           <button class="btn small" data-act="save">${t("editorSave")}</button>
           <button class="btn ghost small" data-act="reload">${t("editorReload")}</button>
           <button class="btn ghost small" data-act="close">${t("editorClose")}</button>
@@ -1028,6 +1034,13 @@ export function createFilePanel(shellId: string, startDir?: string, connectionId
     const editorBox = overlay.querySelector<HTMLElement>(".editor-body")!;
     const saveButton = overlay.querySelector<HTMLButtonElement>('[data-act="save"]')!;
     const reloadButton = overlay.querySelector<HTMLButtonElement>('[data-act="reload"]')!;
+    const encodingSelect = overlay.querySelector<HTMLSelectElement>('[data-act="encoding"]')!;
+    // per-editor-session encoding override; "" = follow the connection's
+    let editorEncoding = "";
+    encodingSelect.addEventListener("change", () => {
+      editorEncoding = encodingSelect.value;
+      void loadWindow(offset);
+    });
     title.textContent = path;
     const editor = createCodeEditor(editorBox, path);
     overlay.querySelector('[data-act="close"]')!.addEventListener("click", () => {
@@ -1068,7 +1081,7 @@ export function createFilePanel(shellId: string, startDir?: string, connectionId
           offset: number;
           limit: number;
           windowed?: boolean;
-        }>("fs/read", { shellId, path, offset: next }, 60000);
+        }>("fs/read", { shellId, path, offset: next, encoding: editorEncoding }, 60000);
         if (result.binary) {
           editor.setDoc("", true);
           readOnlyNow = true;
@@ -1084,15 +1097,16 @@ export function createFilePanel(shellId: string, startDir?: string, connectionId
         // locally: the tail window reaches EOF but must stay read-only — an
         // editable partial view saved back would truncate the whole file.
         const windowed = totalSize > result.limit;
+        const encNote = String((result as any).encoding || "");
         editor.setDoc(result.contentBase64 ? base64ToUtf8(result.contentBase64) : "", windowed);
         readOnlyNow = windowed;
         saveButton.hidden = windowed;
         nav.hidden = !windowed;
         if (windowed) {
           range.textContent = `${humanSize(offset)} – ${humanSize(offset + result.limit)} / ${humanSize(totalSize)}`;
-          status.textContent = t("editorWindowed");
+          status.textContent = `${t("editorWindowed")} · ${encNote}`;
         } else {
-          status.textContent = humanSize(totalSize);
+          status.textContent = `${humanSize(totalSize)} · ${encNote}`;
         }
         if (jumpEnd) editor.scrollToEnd();
       } catch (error: any) {
@@ -1123,7 +1137,7 @@ export function createFilePanel(shellId: string, startDir?: string, connectionId
       saveButton.disabled = true;
       status.textContent = t("connecting");
       try {
-        await api("fs/write", { shellId, path, contentBase64: utf8ToBase64(editor.getValue()) }, 120000);
+        await api("fs/write", { shellId, path, contentBase64: utf8ToBase64(editor.getValue()), encoding: editorEncoding }, 120000);
         status.textContent = t("editorSaved");
         void load();
       } catch (error: any) {

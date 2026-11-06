@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"time"
+)
 
 func TestParseCpuLine(t *testing.T) {
 	counters, ok := parseCpuLine("cpu  100 0 50 800 30 0 0 20 0 0")
@@ -47,5 +51,58 @@ func TestParseDfKb(t *testing.T) {
 	}
 	if got := parseDfKb("Filesystem 1024-blocks Used Available Capacity Mounted on"); len(got) != 0 {
 		t.Fatal("header line must be skipped")
+	}
+}
+
+func TestParsePsAux(t *testing.T) {
+	body := "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\n" +
+		"root         1  0.0  0.1 125432  3120 ?        Ss   Oct01   0:31 /usr/lib/systemd/systemd --switched-root\n" +
+		"root      4811 43.2 12.8 8132556 1048576 ?        Sl   Oct01 331:11 java -jar finpss-ccs-booter.jar\n" +
+		"cc50      5233  0.1  0.3 118220  5120 pts/0    R+   10:31   0:00 ps aux --sort=-pcpu"
+	procs := parsePsAux(body)
+	if len(procs) != 3 {
+		t.Fatalf("want 3 processes (header skipped), got %d", len(procs))
+	}
+	java := procs[1]
+	if java["pid"] != 4811 || java["cpuPct"].(float64) != 43.2 {
+		t.Fatalf("java row parsed wrong: %v", java)
+	}
+	if command := java["command"].(string); !strings.HasPrefix(command, "java -jar") {
+		t.Fatalf("command should rejoin the tail fields: %q", command)
+	}
+}
+
+func TestParseGpuCsv(t *testing.T) {
+	gpus := parseGpuCsv("NVIDIA GeForce RTX 3090, 78, 22012, 24576\nTesla V100-SXM2-32GB, 12, 1024, 32768")
+	if len(gpus) != 2 {
+		t.Fatalf("want 2 gpus, got %d", len(gpus))
+	}
+	first := gpus[0]
+	if first["name"] != "NVIDIA GeForce RTX 3090" || first["utilPct"].(float64) != 78 || first["memTotalMb"].(float64) != 24576 {
+		t.Fatalf("gpu row parsed wrong: %v", first)
+	}
+	if len(parseGpuCsv("")) != 0 {
+		t.Fatal("empty gpu segment must parse to an empty list")
+	}
+}
+
+func TestNetRateKbpsDiff(t *testing.T) {
+	conn := &Conn{}
+	first := "Inter-|   Receive                                                |  Transmit\n" +
+		" face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n" +
+		"  eth0: 1048576 0 0 0 0 0 0 0  2097152 0 0 0 0 0 0 0\n" +
+		"    lo: 100 0 0 0 0 0 0 0  100 0 0 0 0 0 0 0\n"
+	rx, tx := conn.netRateKbps(first)
+	if rx != 0 || tx != 0 {
+		t.Fatal("first sample must report zero rates")
+	}
+	conn.monitorMutex.Lock()
+	conn.lastNetAt = conn.lastNetAt.Add(-2 * time.Second) // pretend 2s elapsed
+	conn.monitorMutex.Unlock()
+	second := strings.Replace(first, "eth0: 1048576", "eth0: 2097152", 1) // +1 MiB rx
+	rx, tx = conn.netRateKbps(second)
+	// 1 MiB over 2s = 512 KB/s; tx unchanged → 0
+	if rx < 511 || rx > 513 || tx != 0 {
+		t.Fatalf("rates wrong: rx=%.1f tx=%.1f", rx, tx)
 	}
 }

@@ -1121,3 +1121,17 @@ input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):focus, selec
 .zm-bar span { display: block; height: 100%; border-radius: 2px; background: var(--accent); transition: width 0.15s; }
 .zm-bar span.zm-ok { background: var(--ok, #3fb950); }
 .zm-finished .zm-name { color: var(--text-dim); }
+
+/* monitor: process table (top by CPU) with per-row kill */
+.monitor-pop { max-height: 520px; }
+.mon-procs { max-height: 180px; overflow-y: auto; margin: 0 8px 8px; border-top: 1px solid var(--border-soft); }
+.mon-proc { display: flex; align-items: center; gap: 6px; padding: 3px 0; font-size: 11px; }
+.mon-proc + .mon-proc { border-top: 1px solid var(--border-soft); }
+.mp-pid { flex: none; width: 46px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.mp-stats { flex: none; width: 130px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.mp-cmd { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono, monospace); }
+.mp-kill {
+  flex: none; width: 18px; height: 18px; border: none; border-radius: 4px;
+  background: transparent; color: var(--text-dim); font-size: 11px; line-height: 1; cursor: pointer;
+}
+.mp-kill:hover { background: var(--bg-hover); color: var(--danger); }

@@ -30,10 +30,13 @@ type Conn struct {
 	shellKind  shellKind
 	promptBase string
 
-	// monitor sampling state: the previous /proc/stat reading the CPU
-	// percentage is differenced against (see monitor.go)
+	// monitor sampling state: the previous /proc/stat and /proc/net/dev
+	// readings the CPU percentage and network rates are differenced
+	// against (see monitor.go)
 	monitorMutex sync.Mutex
 	lastCpu      cpuCounters
+	lastNet      map[string]netCounters
+	lastNetAt    time.Time
 
 	closed atomic.Bool
 	dead   atomic.Bool
