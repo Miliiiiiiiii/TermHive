@@ -482,6 +482,9 @@ export async function mountSession(context: SessionContext): Promise<() => void>
       writeTerm: (data) => tab.term!.write(tab.highlighter!.process(data)),
       sendToPty: (data) => sendBinary(`term/${tab.shellId}`, data),
       notify: (text, kind) => notify(text, kind),
+      diag: (line) => {
+        void api("diag/log", { line: `zmodem: ${line}` }, 5000).catch(() => undefined);
+      },
     });
     tab.offBinary = onBinaryChannel(`term/${tab.shellId}`, (data) => {
       tab.zmodemSentry!.consume(data);
@@ -579,6 +582,9 @@ export async function mountSession(context: SessionContext): Promise<() => void>
         writeTerm: (data) => tab.term!.write(tab.highlighter!.process(data)),
         sendToPty: (data) => sendBinary(`term/${tab.shellId}`, data),
         notify: (text, kind) => notify(text, kind),
+        diag: (line) => {
+          void api("diag/log", { line: `zmodem: ${line}` }, 5000).catch(() => undefined);
+        },
       });
       tab.offBinary = onBinaryChannel(`term/${shellId}`, (data) => tab.zmodemSentry!.consume(data));
     }
