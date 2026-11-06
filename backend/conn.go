@@ -231,20 +231,33 @@ func (conn *Conn) probeShellKind() shellKind {
 	return kindUnknown
 }
 
-// integrationSnippet is the one-line startup hook that makes the shell emit
+// integrationSnippet is the startup hook that makes the shell emit
 // OSC 7 file:// URLs on every prompt. The tty echo of this line never reaches
 // the terminal: injectFollowHook wraps it in a sentinel-suppressed output
 // window, so no cls/clear is needed and the login banner stays untouched.
-// The leading space keeps it out of bash history wherever HISTCONTROL=
-// ignorespace applies. All snippets are pure ASCII so GBK/GB18030 connections
-// pass them through unchanged. printf '\033]7;file://%s\033\134' emits
-// ESC ] 7 ; file:///current/path ESC \ (empty host = localhost).
+//
+// History hygiene (pressing Up must surface ONLY the user's own commands):
+// after installing the hook, the line clears the in-memory history list and
+// re-reads it from the history file — the injected entry (never written to
+// disk) evaporates and the list returns to its just-logged-in state, with
+// ZERO residue on every bash/zsh version. `history -d $((HISTCMD))` was
+// tried first: fine on bash 5, but CentOS 7's bash 4.2 mis-expands HISTCMD
+// and the delete misses. A HISTCONTROL=ignorespace preset line was tried
+// next: works, but leaves that one visible entry behind. The clear+re-read
+// tail is guarded on a non-empty HISTFILE so a shell without a history file
+// never loses its in-memory list; it runs at connect time when the user has
+// typed nothing yet, so the reset is lossless. The leading space stays as a
+// bonus for machines already ignoring space-prefixed commands. fish ignores
+// space-prefixed commands by built-in default. All snippets are pure ASCII
+// so GBK/GB18030 connections pass them through unchanged. printf
+// '\033]7;file://%s\033\134' emits ESC ] 7 ; file:///current/path ESC \
+// (empty host = localhost).
 func (kind shellKind) integrationSnippet(promptBase string) string {
 	switch kind {
 	case kindBash:
-		return ` __osc7(){ printf '\033]7;file://%s\033\134' "$PWD"; };PROMPT_COMMAND="__osc7${PROMPT_COMMAND:+;$PROMPT_COMMAND}"`
+		return ` __osc7(){ printf '\033]7;file://%s\033\134' "$PWD"; };PROMPT_COMMAND="__osc7${PROMPT_COMMAND:+;$PROMPT_COMMAND}";[ -n "$HISTFILE" ]&&{ history -c;history -r; }`
 	case kindZsh:
-		return ` __osc7(){ printf '\033]7;file://%s\033\134' "$PWD"; };precmd_functions=(__osc7 $precmd_functions)`
+		return ` __osc7(){ printf '\033]7;file://%s\033\134' "$PWD"; };precmd_functions=(__osc7 $precmd_functions);[[ -n "$HISTFILE" ]]&&{ fc -c;fc -R "$HISTFILE"; }`
 	case kindFish:
 		return ` function __osc7; printf '\033]7;file://%s\033\134' "$PWD"; end;functions -c fish_prompt __th7;function fish_prompt;__osc7;__th7;end`
 	case kindPowerShell:

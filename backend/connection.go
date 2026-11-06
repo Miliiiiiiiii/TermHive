@@ -431,17 +431,23 @@ func (manager *Manager) injectFollowHook(conn *Conn, shell *Shell) {
 		return
 	}
 	if conn.Spec.StartupCmd == "" {
-		// hide the echo of the line we type (from a distinctive prefix of the
-		// snippet) until the first LIVE OSC 7 report proves the hook took
-		// effect. One mechanism for every shell family: the trigger is real
-		// escape bytes that no echo/redraw copy of the injected line can
-		// carry, and the rolling filter never holds the user's own keystrokes
-		// — the shell kind only shapes the snippet itself
-		prefix := snippet
-		if len(prefix) > 16 {
-			prefix = prefix[:16]
+		// hide the echo of every line we type (a distinctive prefix of EACH
+		// snippet line — the bash/zsh history-hygiene preset line included)
+		// until the first LIVE OSC 7 report proves the hook took effect. One
+		// mechanism for every shell family: the trigger is real escape bytes
+		// that no echo/redraw copy of the injected lines can carry, and the
+		// rolling filter never holds the user's own keystrokes — the shell
+		// kind only shapes the snippet itself
+		var markers []string
+		for _, line := range strings.Split(snippet, "\n") {
+			if len(line) > 16 {
+				line = line[:16]
+			}
+			if strings.TrimSpace(line) != "" {
+				markers = append(markers, line)
+			}
 		}
-		shell.BeginHideWindow(prefix, osc7Trigger)
+		shell.BeginHideWindow(markers, osc7Trigger)
 		err := shell.Write([]byte(snippet + "\n"))
 		if err != nil {
 			manager.writeDiag("follow hook write failed: " + err.Error())

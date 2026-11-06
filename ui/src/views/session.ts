@@ -94,7 +94,7 @@ export async function mountSession(context: SessionContext): Promise<() => void>
       <div class="shell-tabs" id="shell-tabs"></div>
       <button class="icon-btn" id="btn-new" title="${t("newTabSame")}">${icon("plus", 15)}</button>
       <span class="spacer"></span>
-      <button class="icon-btn" id="btn-settings" title="${t("openSettings")}">${icon("palette", 15)}</button>
+      <button class="icon-btn" id="btn-settings" title="${t("openSettings")}">${icon("settings", 15)}</button>
       <button class="icon-btn" id="btn-server" title="${t("addServer")}">${icon("server", 15)}</button>
       <button class="icon-btn" id="btn-split" hidden>${icon("columns", 16)}</button>
       <button class="icon-btn" id="btn-files" title="${t("toggleFiles")}">${icon("files", 16)}</button>

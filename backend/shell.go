@@ -51,7 +51,7 @@ type Shell struct {
 	// split across flushes must not leak its beginning); the banner before
 	// the marker flows with at most that sub-millisecond delay.
 	suppressMutex sync.Mutex
-	hideStart     []byte
+	hideStart     [][]byte
 	hideEnd       []byte
 	hideDeadline  time.Time
 	hideBuf       []byte
@@ -84,17 +84,22 @@ func (shell *Shell) CloseReason() string { return shell.closeReason }
 const hideIdleWindow = 3 * time.Second
 
 // BeginHideWindow arms the echo-hiding window: a rolling region filter that
-// drops every paint region containing startMarker (the echoed hook line and
-// any repaint/redraw copies of it) and closes at endMarker — the first LIVE
-// OSC 7 escape sequence, which only exists once the hook actually took effect
-// (the echoed line carries it as literal "$E]7;" / '\033]7;' text, never the
-// escape byte, so repaints cannot spoof the close). Bytes outside marker
-// regions — the user's keystrokes included — flow live the whole time; the
-// window self-cancels after hideIdleWindow of silence.
-func (shell *Shell) BeginHideWindow(startMarker, endMarker string) {
+// drops every paint region containing ANY of startMarkers (the echoed hook
+// lines — the injection may be several lines, e.g. the HISTCONTROL preset
+// line ahead of the hook itself — plus any repaint/redraw copies of them)
+// and closes at endMarker — the first LIVE OSC 7 escape sequence, which only
+// exists once the hook actually took effect (the echoed lines carry it as
+// literal "$E]7;" / '\033]7;' text, never the escape byte, so repaints cannot
+// spoof the close). Bytes outside marker regions — the user's keystrokes
+// included — flow live the whole time; the window self-cancels after
+// hideIdleWindow of silence.
+func (shell *Shell) BeginHideWindow(startMarkers []string, endMarker string) {
 	shell.suppressMutex.Lock()
 	defer shell.suppressMutex.Unlock()
-	shell.hideStart = []byte(startMarker)
+	shell.hideStart = make([][]byte, 0, len(startMarkers))
+	for _, marker := range startMarkers {
+		shell.hideStart = append(shell.hideStart, []byte(marker))
+	}
 	shell.hideEnd = []byte(endMarker)
 	shell.hideDeadline = time.Now().Add(hideIdleWindow)
 	shell.hideBuf = nil
@@ -134,18 +139,18 @@ func firstPaintBoundaryEnd(buf []byte) int {
 // filterOsc7Regions is the rolling hide filter. The buffer is walked in paint
 // regions — a region ends at a newline or carriage return (inclusive) or at
 // the end of a cursor-position / erase-line sequence, whichever comes first —
-// and every region WITHOUT the hook marker flows out live (the user's
+// and every region WITHOUT any hook marker flows out live (the user's
 // keystrokes must never be held back or dropped just because the window is
-// open); regions WITH the marker — the echoed hook line and any repaint or
-// readline-redraw copies of it — are dropped. CR and EL boundaries are what
+// open); regions WITH a marker — the echoed hook lines and any repaint or
+// readline-redraw copies of them — are dropped. CR and EL boundaries are what
 // keep a redraw copy from swallowing the user bytes that follow it. The first
 // LIVE OSC 7 trigger closes the window: its region is emitted (the follow
 // feature listens for those bytes), along with everything behind it.
 // final=true is the idle-expiry variant: the trailing incomplete region is
-// decided now (dropped only if it holds the marker) instead of being held for
+// decided now (dropped only if it holds a marker) instead of being held for
 // more bytes. Returns the bytes to emit, the unconsumed tail (only when
 // !done), done.
-func filterOsc7Regions(buf, marker, trigger []byte, final bool) (kept, tail []byte, done bool) {
+func filterOsc7Regions(buf []byte, markers [][]byte, trigger []byte, final bool) (kept, tail []byte, done bool) {
 	kept = make([]byte, 0, len(buf))
 	pos := 0
 	for pos < len(buf) {
@@ -163,14 +168,14 @@ func filterOsc7Regions(buf, marker, trigger []byte, final bool) (kept, tail []by
 		if at := bytes.Index(region, trigger); at >= 0 {
 			// the live trigger: emit its region (dropping any marker bytes
 			// glued ahead of it in the same region) plus everything after it
-			if bytes.Contains(region, marker) {
+			if containsAny(region, markers) {
 				kept = append(kept, region[at:]...)
 			} else {
 				kept = append(kept, region...)
 			}
 			return kept, nil, true
 		}
-		if !bytes.Contains(region, marker) {
+		if !containsAny(region, markers) {
 			kept = append(kept, region...)
 			pos = end
 		} else if region[len(region)-1] == '\r' && end < len(buf) && buf[end] == '\n' {
@@ -183,7 +188,7 @@ func filterOsc7Regions(buf, marker, trigger []byte, final bool) (kept, tail []by
 	}
 	tail = buf[pos:]
 	if at := bytes.Index(tail, trigger); at >= 0 {
-		if bytes.Contains(tail[:at], marker) {
+		if containsAny(tail[:at], markers) {
 			kept = append(kept, tail[at:]...)
 		} else {
 			kept = append(kept, tail...)
@@ -191,12 +196,22 @@ func filterOsc7Regions(buf, marker, trigger []byte, final bool) (kept, tail []by
 		return kept, nil, true
 	}
 	if final {
-		if !bytes.Contains(tail, marker) {
+		if !containsAny(tail, markers) {
 			kept = append(kept, tail...)
 		}
 		return kept, nil, true
 	}
 	return kept, tail, false
+}
+
+// containsAny reports whether the region carries any of the hook markers.
+func containsAny(region []byte, markers [][]byte) bool {
+	for _, marker := range markers {
+		if bytes.Contains(region, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // suppressChunk runs one flush through the hiding window. It returns the

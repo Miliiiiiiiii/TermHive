@@ -11,7 +11,7 @@ export function mountHome(): () => void {
   root.className = "home launcher";
   root.innerHTML = `
     <div class="home-actions">
-      <button class="icon-btn" id="btn-settings" title="${t("openSettings")}">${icon("palette", 15)}</button>
+      <button class="icon-btn" id="btn-settings" title="${t("openSettings")}">${icon("settings", 15)}</button>
     </div>
     <div class="launcher-inner">
       <div class="launcher-hero">

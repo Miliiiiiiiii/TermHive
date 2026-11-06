@@ -31,8 +31,16 @@ func feed(t *testing.T, shell *Shell, chunks []string) string {
 
 func TestHideWindowBannerSurvives(t *testing.T) {
 	shell := &Shell{}
-	snippet := ` __osc7(){ printf '\033]7;file://%s\033\134' "$PWD"; };PROMPT_COMMAND="__osc7"`
-	shell.BeginHideWindow(snippet[:16], osc7Trigger)
+	snippet := ` __osc7(){ printf '\033]7;file://%s\033\134' "$PWD"; };PROMPT_COMMAND="__osc7${PROMPT_COMMAND:+;$PROMPT_COMMAND}";[ -n "$HISTFILE" ]&&{ history -c;history -r; }`
+	// one marker per snippet line, exactly how injectFollowHook arms the window
+	markers := []string{}
+	for _, line := range strings.Split(snippet, "\n") {
+		if len(line) > 16 {
+			line = line[:16]
+		}
+		markers = append(markers, line)
+	}
+	shell.BeginHideWindow(markers, osc7Trigger)
 
 	// banner first, then the echoed injection line (bash/readline echo),
 	// user keystrokes while the window is still open, and finally the first
@@ -63,7 +71,7 @@ func TestHideWindowBannerSurvives(t *testing.T) {
 func TestHideWindowMarkerSplitAcrossFlushes(t *testing.T) {
 	shell := &Shell{}
 	snippet := " __osc7(){ printf"
-	shell.BeginHideWindow(snippet, osc7Trigger)
+	shell.BeginHideWindow([]string{snippet}, osc7Trigger)
 
 	got := feed(t, shell, []string{
 		"TEST-BANNER\r\nECHO:",
@@ -88,7 +96,7 @@ func TestHideWindowMarkerSplitAcrossFlushes(t *testing.T) {
 
 func TestHideWindowDeadlineFallback(t *testing.T) {
 	shell := &Shell{}
-	shell.BeginHideWindow(" __osc7", testOsc7)
+	shell.BeginHideWindow([]string{" __osc7"}, testOsc7)
 	// the window survives while bytes keep flowing; it disarms only after
 	// hideIdleWindow of SILENCE
 	time.Sleep(hideIdleWindow + 150*time.Millisecond)
@@ -105,7 +113,7 @@ func TestHideWindowDeadlineFallback(t *testing.T) {
 func TestHideWindowWholeHandshakeSameFlush(t *testing.T) {
 	shell := &Shell{}
 	snippet := ` PROMPT $E]7;file:///$P$E\gordo@MILII $P$G`
-	shell.BeginHideWindow(snippet[:16], osc7Trigger)
+	shell.BeginHideWindow([]string{snippet[:16]}, osc7Trigger)
 
 	emit, done := shell.suppressChunk([]byte(
 		"Microsoft Windows [版本 10.0.26200.9711]\r\n" +
@@ -136,7 +144,7 @@ func TestHideWindowWholeHandshakeSameFlush(t *testing.T) {
 func TestHideWindowCupKeepsCopyright(t *testing.T) {
 	shell := &Shell{}
 	snippet := ` PROMPT $E]7;file:///$P$E\gordo@MILII $P$G`
-	shell.BeginHideWindow(snippet[:16], osc7Trigger)
+	shell.BeginHideWindow([]string{snippet[:16]}, osc7Trigger)
 
 	emit, done := shell.suppressChunk([]byte(
 		"Microsoft Windows [版本 10.0.26200.9711]\r\n" +
@@ -160,7 +168,7 @@ func TestHideWindowCupKeepsCopyright(t *testing.T) {
 // a marker-carrying tail), or it blurts into the terminal as junk text
 func TestHideWindowExpiryDropsEchoLine(t *testing.T) {
 	shell := &Shell{}
-	shell.BeginHideWindow(" __osc7", osc7Trigger)
+	shell.BeginHideWindow([]string{" __osc7"}, osc7Trigger)
 	shell.hideBuf = []byte("banner kept\r\necho:  __osc7(){ printf 'x'\r\nlater-bytes")
 	shell.hideDeadline = time.Now().Add(-time.Millisecond)
 	emit, done := shell.suppressChunk([]byte("TAIL"))
@@ -185,7 +193,7 @@ func TestHideWindowExpiryDropsEchoLine(t *testing.T) {
 func TestHideWindowOsc7RepaintCopyKeepsWindowOpen(t *testing.T) {
 	shell := &Shell{}
 	snippet := ` PROMPT $E]7;file:///$P$E\gordo@MILII $P$G`
-	shell.BeginHideWindow(snippet[:16], osc7Trigger)
+	shell.BeginHideWindow([]string{snippet[:16]}, osc7Trigger)
 
 	// the captured timeline: banner; tty echo of the hook line (cmd has NOT
 	// executed it yet); a ConPTY repaint carrying a COPY of the echoed line;
@@ -222,8 +230,15 @@ func TestHideWindowOsc7RepaintCopyKeepsWindowOpen(t *testing.T) {
 // prompt line by the idle window — typing still echoes live
 func TestHideWindowPosixRedrawCopyAndNoOsc7(t *testing.T) {
 	shell := &Shell{}
-	snippet := ` __osc7(){ printf '\033]7;file://%s\033\134' "$PWD"; };PROMPT_COMMAND="__osc7"`
-	shell.BeginHideWindow(snippet[:16], osc7Trigger)
+	snippet := ` __osc7(){ printf '\033]7;file://%s\033\134' "$PWD"; };PROMPT_COMMAND="__osc7${PROMPT_COMMAND:+;$PROMPT_COMMAND}";[ -n "$HISTFILE" ]&&{ history -c;history -r; }`
+	markers := []string{}
+	for _, line := range strings.Split(snippet, "\n") {
+		if len(line) > 16 {
+			line = line[:16]
+		}
+		markers = append(markers, line)
+	}
+	shell.BeginHideWindow(markers, osc7Trigger)
 
 	// MOTD, the echoed injection line at 80 cols, a readline full-line
 	// re-render (same bytes again), then the user typing while bash has not

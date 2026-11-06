@@ -363,9 +363,14 @@ function openColorWheel(
   anchor.append(wrap);
 }
 
-// renderStylePop builds the whole settings panel into `pop`. Every mutation
-// clones the state, reports it through onChanged (the host view applies to
-// its terminals and saves — the broadcast then updates every other surface).
+// renderStylePop builds the whole settings panel into `pop` as a stack of
+// setting cards mirroring the DBX host's design language (its shadcn-style
+// settings): one rounded bordered card per setting — label + muted
+// description on the left, control on the right — with the host's pill
+// switch proportions (32×18, 24×14 sm), h-8 selects and h-7 rule inputs.
+// Every color and radius comes from the injected theme tokens, so the page
+// follows the host theme for free. Mutations clone the state and report
+// through onChanged; the broadcast then updates every other surface.
 export function renderStylePop(
   pop: HTMLElement,
   state: StyleSettings,
@@ -373,12 +378,6 @@ export function renderStylePop(
 ): void {
   const labels = colorLabel();
   pop.innerHTML = "";
-  const section = (label: string): void => {
-    const head = document.createElement("div");
-    head.className = "settings-head";
-    head.textContent = label;
-    pop.append(head);
-  };
   const commit = (patch: (draft: StyleSettings) => void): void => {
     const next: StyleSettings = {
       ...state,
@@ -392,120 +391,162 @@ export function renderStylePop(
     renderStylePop(pop, state, onChanged);
   };
 
-  section(t("schemeLabel"));
-  const schemeRow = document.createElement("label");
-  schemeRow.className = "settings-row";
+  // ---- small builders -----------------------------------------------------
+
+  // host-style pill switch (checkbox input stays in the DOM for a11y/focus)
+  const makeSwitch = (checked: boolean, onChange: (value: boolean) => void, small = false): HTMLLabelElement => {
+    const sw = document.createElement("label");
+    sw.className = small ? "th-switch sm" : "th-switch";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = checked;
+    input.addEventListener("change", () => onChange(input.checked));
+    const track = document.createElement("span");
+    track.className = "sw-track";
+    const thumb = document.createElement("span");
+    thumb.className = "sw-thumb";
+    track.append(thumb);
+    sw.append(input, track);
+    return sw;
+  };
+
+  const settingCard = (label: string, desc: string, control: HTMLElement | null): HTMLElement => {
+    const card = document.createElement("div");
+    card.className = "stg-card";
+    const text = document.createElement("div");
+    text.className = "stg-text";
+    const name = document.createElement("div");
+    name.className = "stg-label";
+    name.textContent = label;
+    const hint = document.createElement("div");
+    hint.className = "stg-desc";
+    hint.textContent = desc;
+    text.append(name, hint);
+    card.append(text);
+    if (control) {
+      const ctl = document.createElement("div");
+      ctl.className = "stg-ctl";
+      ctl.append(control);
+      card.append(ctl);
+    }
+    pop.append(card);
+    return card;
+  };
+
+  const numberInput = (
+    value: number,
+    min: number,
+    max: number,
+    title: string,
+    onChange: (value: number) => void,
+  ): HTMLInputElement => {
+    const input = document.createElement("input");
+    input.type = "number";
+    input.className = "stg-num";
+    input.min = String(min);
+    input.max = String(max);
+    input.step = "1";
+    input.value = String(value);
+    input.title = title;
+    input.addEventListener("change", () => {
+      const clamped = Math.min(max, Math.max(min, Math.round(Number(input.value) || min)));
+      input.value = String(clamped);
+      onChange(clamped);
+    });
+    return input;
+  };
+
+  const unitSpan = (text: string): HTMLElement => {
+    const el = document.createElement("span");
+    el.className = "stg-unit";
+    el.textContent = text;
+    return el;
+  };
+
+  // ---- cards ---------------------------------------------------------------
+
   const schemeSelect = document.createElement("select");
   schemeSelect.innerHTML =
     `<option value="auto">${t("schemeAuto")}</option>` +
     SCHEMES.map((def) => `<option value="${def.id}">${def.name}</option>`).join("");
   schemeSelect.value = state.scheme;
   schemeSelect.addEventListener("change", () => commit((draft) => (draft.scheme = schemeSelect.value)));
-  schemeRow.append(schemeSelect);
-  pop.append(schemeRow);
+  settingCard(t("schemeLabel"), t("schemeDesc"), schemeSelect);
 
-  section(t("highlightLabel"));
-  const toggleRow = document.createElement("label");
-  toggleRow.className = "settings-row";
-  const highlightToggle = document.createElement("input");
-  highlightToggle.type = "checkbox";
-  highlightToggle.checked = state.highlight;
-  highlightToggle.addEventListener("change", () =>
-    commit((draft) => (draft.highlight = highlightToggle.checked)),
-  );
-  const toggleText = document.createElement("span");
-  toggleText.textContent = t("highlightLabel");
-  toggleRow.append(highlightToggle, toggleText);
-  pop.append(toggleRow);
-
-  section(t("behaviorLabel"));
-  const behaviorRow = (key: "sessionLog"): void => {
-    const row = document.createElement("label");
-    row.className = "settings-row";
-    const box = document.createElement("input");
-    box.type = "checkbox";
-    box.checked = state[key];
-    box.addEventListener("change", () => commit((draft) => (draft[key] = box.checked)));
-    const text = document.createElement("span");
-    text.textContent = t("sessionLogLabel");
-    row.append(box, text);
-    pop.append(row);
-  };
   // auto-reconnect carries its give-up budget: after this many failed redials
   // the supervisor stops and the manual-reconnect overlay takes over (an
   // unreachable server would otherwise be retried forever)
   {
-    const row = document.createElement("div");
-    row.className = "settings-row";
-    const box = document.createElement("input");
-    box.type = "checkbox";
-    box.checked = state.autoReconnect;
-    box.addEventListener("change", () =>
-      commit((draft) => (draft.autoReconnect = box.checked)),
+    const attempts = numberInput(
+      state.autoReconnectMaxAttempts,
+      1,
+      500,
+      t("autoReconnectMaxTitle"),
+      (value) => commit((draft) => (draft.autoReconnectMaxAttempts = value)),
     );
-    const text = document.createElement("span");
-    text.textContent = t("autoReconnectLabel");
-    const attemptsInput = document.createElement("input");
-    attemptsInput.type = "number";
-    attemptsInput.className = "num";
-    attemptsInput.min = "1";
-    attemptsInput.max = "500";
-    attemptsInput.step = "1";
-    attemptsInput.value = String(state.autoReconnectMaxAttempts);
-    attemptsInput.disabled = !state.autoReconnect;
-    attemptsInput.title = t("autoReconnectMaxTitle");
-    attemptsInput.addEventListener("change", () => {
-      const value = Math.min(500, Math.max(1, Math.round(Number(attemptsInput.value) || 1)));
-      attemptsInput.value = String(value);
-      commit((draft) => (draft.autoReconnectMaxAttempts = value));
-    });
-    const attemptsUnit = document.createElement("span");
-    attemptsUnit.className = "unit";
-    attemptsUnit.textContent = t("attemptsUnit");
-    row.append(box, text, attemptsInput, attemptsUnit);
-    pop.append(row);
+    attempts.disabled = !state.autoReconnect;
+    const ctl = document.createElement("div");
+    ctl.className = "stg-ctl";
+    ctl.append(
+      makeSwitch(state.autoReconnect, (value) => commit((draft) => (draft.autoReconnect = value))),
+      attempts,
+      unitSpan(t("attemptsUnit")),
+    );
+    settingCard(t("autoReconnectLabel"), t("autoReconnectDesc"), null).append(ctl);
   }
-  behaviorRow("sessionLog");
-  // finished-transfer rows: auto-dismiss after N seconds (0 = immediately,
-  // once the fade completes), off keeps them for manual inspection
-  const closeRow = document.createElement("div");
-  closeRow.className = "settings-row";
-  const closeBox = document.createElement("input");
-  closeBox.type = "checkbox";
-  closeBox.checked = state.transferAutoClose;
-  closeBox.addEventListener("change", () =>
-    commit((draft) => (draft.transferAutoClose = closeBox.checked)),
-  );
-  const closeText = document.createElement("span");
-  closeText.textContent = t("transferAutoCloseLabel");
-  const delayInput = document.createElement("input");
-  delayInput.type = "number";
-  delayInput.className = "num";
-  delayInput.min = "0";
-  delayInput.max = "3600";
-  delayInput.step = "1";
-  delayInput.value = String(state.transferAutoCloseDelay);
-  delayInput.disabled = !state.transferAutoClose;
-  delayInput.addEventListener("change", () => {
-    const value = Math.min(3600, Math.max(0, Math.round(Number(delayInput.value) || 0)));
-    delayInput.value = String(value);
-    commit((draft) => (draft.transferAutoCloseDelay = value));
-  });
-  const delayUnit = document.createElement("span");
-  delayUnit.className = "unit";
-  delayUnit.textContent = t("secondsUnit");
-  closeRow.append(closeBox, closeText, delayInput, delayUnit);
-  pop.append(closeRow);
+  {
+    const delay = numberInput(
+      state.transferAutoCloseDelay,
+      0,
+      3600,
+      t("transferAutoCloseDesc"),
+      (value) => commit((draft) => (draft.transferAutoCloseDelay = value)),
+    );
+    delay.disabled = !state.transferAutoClose;
+    const ctl = document.createElement("div");
+    ctl.className = "stg-ctl";
+    ctl.append(
+      makeSwitch(state.transferAutoClose, (value) => commit((draft) => (draft.transferAutoClose = value))),
+      delay,
+      unitSpan(t("secondsUnit")),
+    );
+    settingCard(t("transferAutoCloseLabel"), t("transferAutoCloseDesc"), null).append(ctl);
+  }
 
-  section(t("rulesLabel"));
+  settingCard(
+    t("sessionLogLabel"),
+    t("sessionLogDesc"),
+    makeSwitch(state.sessionLog, (value) => commit((draft) => (draft.sessionLog = value))),
+  );
+
+  // ---- highlight rules: one wide card, master switch in the header --------
+
+  const rulesCard = document.createElement("div");
+  rulesCard.className = "stg-card stg-rules";
+  const rulesHead = document.createElement("div");
+  rulesHead.className = "stg-rules-head";
+  const rulesText = document.createElement("div");
+  rulesText.className = "stg-text";
+  const rulesName = document.createElement("div");
+  rulesName.className = "stg-label";
+  rulesName.textContent = t("rulesLabel");
+  const rulesHint = document.createElement("div");
+  rulesHint.className = "stg-desc";
+  rulesHint.textContent = t("highlightDesc");
+  rulesText.append(rulesName, rulesHint);
+  rulesHead.append(rulesText, makeSwitch(state.highlight, (value) => commit((draft) => (draft.highlight = value))));
+  rulesCard.append(rulesHead);
+
+  const modeHint = document.createElement("div");
+  modeHint.className = "stg-desc stg-rules-mode";
+  modeHint.textContent = t("rulesDesc");
+  rulesCard.append(modeHint);
+
   state.rules.forEach((rule, index) => {
     const row = document.createElement("div");
     row.className = "rule-row";
-    const enable = document.createElement("input");
-    enable.type = "checkbox";
-    enable.checked = rule.enabled;
-    enable.addEventListener("change", () =>
-      commit((draft) => (draft.rules[index].enabled = enable.checked)),
+    row.append(
+      makeSwitch(rule.enabled, (value) => commit((draft) => (draft.rules[index].enabled = value)), true),
     );
     const name = document.createElement("input");
     name.type = "text";
@@ -572,8 +613,8 @@ export function renderStylePop(
         draft.rules.splice(index, 1);
       }),
     );
-    row.append(enable, name, pattern, color, mode, del);
-    pop.append(row);
+    row.append(name, pattern, color, mode, del);
+    rulesCard.append(row);
   });
 
   const actions = document.createElement("div");
@@ -607,5 +648,6 @@ export function renderStylePop(
     });
   });
   actions.append(add, reset);
-  pop.append(actions);
+  rulesCard.append(actions);
+  pop.append(rulesCard);
 }
