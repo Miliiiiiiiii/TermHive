@@ -56,6 +56,16 @@ type Shell struct {
 	hideEnd       []byte
 	hideDeadline  time.Time
 	hideBuf       []byte
+	// hiding the injected echo leaves the cursor parked at the start of the
+	// prompt line (the surviving bytes end in CR) while the shell's line
+	// editor still models it after the prompt. One same-size window-change
+	// once the window closes makes readline repaint the prompt line, which
+	// parks the cursor where it belongs. POSIX shells only — ConPTY answers
+	// a no-op resize with a full-screen re-emit.
+	hideRedrawOnClose bool
+	hideRedrawFired   bool
+	lastCols          int
+	lastRows          int
 
 	closed      atomic.Bool
 	closeMutex  sync.Mutex
@@ -130,6 +140,31 @@ func markerFragments(lines [][]byte) [][]byte {
 		}
 	}
 	return frags
+}
+
+// armHideRedrawLocked schedules the one-shot same-size window-change for
+// after the hide window closes (caller holds suppressMutex; the network call
+// runs on its own goroutine, never under the lock).
+func (shell *Shell) armHideRedrawLocked() {
+	if !shell.hideRedrawOnClose || shell.hideRedrawFired {
+		return
+	}
+	shell.hideRedrawFired = true
+	go shell.nudgeRedraw()
+}
+
+// nudgeRedraw re-sends the last known window size: readline answers WINCH by
+// repainting the current (prompt) line, which also restores the cursor to
+// the position the shell's line editor models — fixing the row-1 cursor the
+// swallowed echo leaves behind. Harmless if the size is still the default.
+func (shell *Shell) nudgeRedraw() {
+	shell.suppressMutex.Lock()
+	cols, rows := shell.lastCols, shell.lastRows
+	shell.suppressMutex.Unlock()
+	if cols <= 0 || rows <= 0 {
+		return
+	}
+	_ = shell.Resize(cols, rows)
 }
 
 // firstPaintBoundaryEnd returns the index just past the first control that
@@ -328,6 +363,7 @@ func (shell *Shell) suppressChunk(chunk []byte) (emit []byte, done bool) {
 		shell.hideStart = nil
 		shell.hideEnd = nil
 		shell.hideBuf = nil
+		shell.armHideRedrawLocked()
 		return append(held, chunk...), true
 	}
 	shell.hideBuf = append(shell.hideBuf, chunk...)
@@ -336,6 +372,7 @@ func (shell *Shell) suppressChunk(chunk []byte) (emit []byte, done bool) {
 		shell.hideStart = nil
 		shell.hideEnd = nil
 		shell.hideBuf = nil
+		shell.armHideRedrawLocked()
 		return kept, true
 	}
 	shell.hideBuf = append([]byte(nil), rest...)
@@ -507,6 +544,8 @@ func ConnectShell(shared *ssh.Client, config ConnSpec, cols, rows int, emitter *
 		session:   session,
 		writeCh:   make(chan []byte, 64),
 		onClosed:  onClosed,
+		lastCols:  cols,
+		lastRows:  rows,
 	}
 
 	stdout, err := session.StdoutPipe()
@@ -680,8 +719,19 @@ func (shell *Shell) Resize(cols, rows int) error {
 	if shell.Closed() || shell.session == nil {
 		return errors.New("shell is closed")
 	}
+	shell.suppressMutex.Lock()
+	shell.lastCols, shell.lastRows = cols, rows
+	shell.suppressMutex.Unlock()
 	_, err := shell.session.SendRequest("window-change", false, ssh.Marshal(struct {
 		W, H, X, Y uint32
 	}{W: uint32(cols), H: uint32(rows)}))
 	return err
+}
+
+// SetHideRedrawOnClose arms the post-hide cursor fixup for shells whose line
+// editor repaints on WINCH (the POSIX family).
+func (shell *Shell) SetHideRedrawOnClose(on bool) {
+	shell.suppressMutex.Lock()
+	shell.hideRedrawOnClose = on
+	shell.suppressMutex.Unlock()
 }

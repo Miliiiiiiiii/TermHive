@@ -536,6 +536,14 @@ func (manager *Manager) injectFollowHook(conn *Conn, shell *Shell) {
 			}
 		}
 		shell.BeginHideWindow(markers, osc7Trigger)
+		// the swallowed echo leaves the cursor at the prompt line's first
+		// column while readline models it after the prompt; the POSIX family
+		// repaints the prompt line on WINCH, so one same-size window-change
+		// after the window closes parks the cursor where it belongs
+		switch kind {
+		case kindBash, kindZsh, kindFish, kindPosixOther:
+			shell.SetHideRedrawOnClose(true)
+		}
 		err := shell.Write([]byte(snippet + "\n"))
 		if err != nil {
 			manager.writeDiag("follow hook write failed: " + err.Error())

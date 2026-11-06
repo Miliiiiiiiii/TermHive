@@ -306,3 +306,47 @@ func TestHideWindowWrappedEchoContinuation(t *testing.T) {
 		t.Fatalf("user keystrokes swallowed after wrapped echo: %q", kept2)
 	}
 }
+
+// TestHideRedrawNudge: closing the hide window (live OSC 7 trigger) must arm
+// the one-shot same-size window-change on POSIX shells — the swallowed echo
+// leaves the cursor at the prompt line's first column and readline's WINCH
+// repaint is what parks it back after the prompt.
+func TestHideRedrawNudge(t *testing.T) {
+	shell := &Shell{
+		ID:       "sh-test",
+		writeCh:  make(chan []byte, 4),
+		lastCols: 120,
+		lastRows: 30,
+	}
+	shell.SetHideRedrawOnClose(true)
+	line := []byte(` PROMPT_COMMAND="__osc7; printf 'x' \"$PWD\"";[ -n "$HISTFILE" ]&&{ history -c;history -r; }`)
+	shell.BeginHideWindow([]string{string(line)}, osc7Trigger)
+
+	echo := append(append([]byte{}, line...), '\r', '\n')
+	_, done := shell.suppressChunk(echo)
+	if done {
+		t.Fatal("window closed before the trigger arrived")
+	}
+	// the hook takes effect: a live OSC 7 report closes the window
+	trigger := append(append([]byte{}, echo...), []byte("\x1b]7;file:///home\x1b\\")...)
+	_, done = shell.suppressChunk(trigger)
+	if !done {
+		t.Fatal("window did not close on the live trigger")
+	}
+	for i := 0; i < 50 && !shell.hideRedrawFired; i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	shell.suppressMutex.Lock()
+	fired := shell.hideRedrawFired
+	shell.suppressMutex.Unlock()
+	if !fired {
+		t.Fatal("redraw nudge never armed when the window closed")
+	}
+	// one-shot: a second window must not arm it again (hideRedrawFired is global)
+	shell.BeginHideWindow([]string{string(line)}, osc7Trigger)
+	shell.suppressChunk(append(append([]byte{}, line...), '\r', '\n'))
+	shell.suppressChunk([]byte("\x1b]7;file:///x\x1b\\"))
+	if !shell.hideRedrawFired {
+		t.Fatal("nudge flag lost its one-shot meaning")
+	}
+}
