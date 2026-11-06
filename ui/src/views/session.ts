@@ -283,16 +283,20 @@ export async function mountSession(context: SessionContext): Promise<() => void>
         else tab.zmodemSentry?.dismiss(item.id);
       });
       zmBox.append(row);
-      // finished items auto-close per the transfer setting (failed/canceled
-      // rows stay for inspection, matching the file-panel queue)
-      if (item.status === "done" && styleState.transferAutoClose && !zmAutoClosed.has(item.id)) {
-        zmAutoClosed.add(item.id);
-        window.setTimeout(
-          () => tab.zmodemSentry?.dismiss(item.id),
-          Math.max(0, styleState.transferAutoCloseDelay * 1000),
-        );
-      }
     }
+    // auto-close is built-in for this card (Xshell-style: transfers close
+    // themselves; the file-panel queue setting does not apply here). Done
+    // rows fade quickly, failed/canceled linger a little longer for a look.
+    for (const { tab, item } of rows) {
+      if (item.status === "active" || zmAutoClosed.has(item.id)) continue;
+      zmAutoClosed.add(item.id);
+      window.setTimeout(
+        () => tab.zmodemSentry?.dismiss(item.id),
+        item.status === "done" ? 2500 : 5000,
+      );
+    }
+    // newest at the bottom: keep the card scrolled to the latest row
+    zmBox.scrollTop = zmBox.scrollHeight;
   }
 
 

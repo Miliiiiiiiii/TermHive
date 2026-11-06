@@ -120,8 +120,16 @@ export function createZmodemSentry(hooks: ZmodemHooks): ZmodemSentryHandle {
   const offers = new Map<number, any>(); // receive-side xfer per item id
   let sendAbortRequested = false;
   let emitTimer = 0;
-  const emit = (): void => {
+  const emit = (immediate = false): void => {
+    if (immediate && emitTimer) {
+      window.clearTimeout(emitTimer);
+      emitTimer = 0;
+    }
     if (emitTimer) return;
+    if (immediate) {
+      hooks.onTransfers?.([...items]);
+      return;
+    }
     emitTimer = window.setTimeout(() => {
       emitTimer = 0;
       hooks.onTransfers?.([...items]);
@@ -176,6 +184,22 @@ export function createZmodemSentry(hooks: ZmodemHooks): ZmodemSentryHandle {
             diag(`suppressed ${suppressedBytes} bytes of ZMODEM noise`);
             suppressedBytes = 0;
           }
+          // push the final item states right away (the throttled emit could
+          // still be holding them back), then reap anything still "active":
+          // an accept() that never resolves must not pin a row open forever
+          emit(true);
+          window.setTimeout(() => {
+            let changed = false;
+            items = items.map((entry) => {
+              if (entry.status === "active") {
+                changed = true;
+                diag(`reaped stalled item ${entry.name}`);
+                return { ...entry, status: "canceled" };
+              }
+              return entry;
+            });
+            if (changed) emit(true);
+          }, 8000);
         });
     },
   });
@@ -276,7 +300,6 @@ export function createZmodemSentry(hooks: ZmodemHooks): ZmodemSentryHandle {
           });
           // a skip() requested from the progress window flips this via the
           // offers map; accept() then resolves early
-          canceled = items.find((entry) => entry.id === item.id)?.status === "canceled";
           try {
             await xfer.accept();
           } catch {
@@ -285,7 +308,11 @@ export function createZmodemSentry(hooks: ZmodemHooks): ZmodemSentryHandle {
           await writeChain;
           await plugin.fileTransfer!.finish(handle.handleId).catch(() => undefined);
           offers.delete(item.id);
-          const finalStatus = canceled || items.find((entry) => entry.id === item.id)?.status === "canceled" ? "canceled" : "done";
+          // read the LIVE row state: a cancel clicked while accept() was
+          // settling must win over the "done" we are about to write
+          const liveStatus = items.find((entry) => entry.id === item.id)?.status;
+          const finalStatus: "done" | "canceled" | "failed" =
+            canceled || liveStatus === "canceled" ? "canceled" : "done";
           upsert({ ...item, status: finalStatus, bytes: received });
           diag(`receive: ${item.name} ${finalStatus} (${received} bytes)`);
         })();
