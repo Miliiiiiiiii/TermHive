@@ -21,6 +21,20 @@ export interface TerminalOptions {
   // file URLs (shell integration hooks injected by the sidecar). Drives the
   // file panel's follow mode.
   onCwd?: (path: string) => void;
+  // font/scrollback preferences from the plugin settings (defaults apply
+  // when absent — the mini window and log viewer ride the same settings)
+  style?: TerminalStyle;
+}
+
+export interface TerminalStyle {
+  /** "" = follow the host's --font-mono / Cascadia fallback chain */
+  fontFamily: string;
+  fontSize: number;
+  scrollback: number;
+}
+
+export function defaultTerminalStyle(): TerminalStyle {
+  return { fontFamily: "", fontSize: 13, scrollback: 5000 };
 }
 
 export interface TerminalHandle {
@@ -34,6 +48,7 @@ export interface TerminalHandle {
   rows: () => number;
   openSearch: () => void;
   setScheme: (schemeId: string) => void;
+  applyStyle: (style: TerminalStyle) => void;
 }
 
 // oscToPath extracts an SFTP-style path from an OSC file-URL payload
@@ -149,14 +164,17 @@ export function createTerminal(
   schemeId = "auto",
   options: TerminalOptions = {},
 ): TerminalHandle {
+  const style = { ...defaultTerminalStyle(), ...options.style };
+  const resolveFont = (custom: string): string =>
+    custom ||
+    tokenColor("--font-mono", "") ||
+    '"Cascadia Mono", Consolas, "Courier New", monospace';
   const terminal = new Terminal({
-    fontFamily:
-      tokenColor("--font-mono", "") ||
-      '"Cascadia Mono", Consolas, "Courier New", monospace',
-    fontSize: 13,
+    fontFamily: resolveFont(style.fontFamily),
+    fontSize: style.fontSize,
     cursorBlink: true,
     allowProposedApi: true,
-    scrollback: 5000,
+    scrollback: style.scrollback,
     theme: themeFor(schemeId),
   });
   const fitAddon = new FitAddon();
@@ -240,6 +258,16 @@ export function createTerminal(
     openSearch,
     setScheme: (schemeId: string) => {
       terminal.options.theme = themeFor(schemeId);
+    },
+    applyStyle: (next: TerminalStyle) => {
+      terminal.options.fontFamily = resolveFont(next.fontFamily);
+      terminal.options.fontSize = next.fontSize;
+      terminal.options.scrollback = next.scrollback;
+      try {
+        fitAddon.fit();
+      } catch {
+        /* ignore zero-size fits */
+      }
     },
   };
 }

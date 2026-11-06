@@ -8,6 +8,7 @@ import { t } from "./i18n";
 import { notify, confirmBox, promptBox } from "./notify";
 import { createTerminal } from "./term";
 import { Highlighter } from "./highlight";
+import { createCodeEditor } from "./cmeditor";
 import { loadStyleSettings, onStyleSettingsChanged } from "./styleSettings";
 import {
   api,
@@ -37,6 +38,8 @@ interface QueueItem {
 }
 
 const UPLOAD_CHUNK = 256 * 1024;
+// upload pipeline depth (chunks in flight; backend writes them concurrently)
+const UPLOAD_WINDOW = 4;
 
 // FilePanel is the per-tab remote browser; followCwd feeds it the terminal's
 // current directory (OSC 7 shell integration) so the follow toggle can react
@@ -50,7 +53,9 @@ export interface FilePanel {
 // BORN there (no home round trip) — otherwise the initial home listing races
 // the follow jump and, being two round trips slower to START but finishing
 // around it, could overwrite the jumped directory right after it rendered.
-export function createFilePanel(shellId: string, startDir?: string): FilePanel {
+// connectionId keys the saved favorite paths (a favorite is meaningless on
+// another server).
+export function createFilePanel(shellId: string, startDir?: string, connectionId = ""): FilePanel {
   let cwd = startDir ?? "";
   const root = document.createElement("div");
   root.className = "fp";
@@ -60,6 +65,9 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
       <button class="icon-btn" data-act="up" title="..">${icon("levelUp")}</button>
       <button class="icon-btn" data-act="refresh" title="${t("refresh")}">${icon("refresh")}</button>
       <button class="icon-btn active" data-act="follow" id="fp-follow" title="${t("followDir")}">${icon("locate")}</button>
+      <button class="icon-btn" data-act="hidden" title="${t("toggleHidden")}">${icon("eye")}</button>
+      <button class="icon-btn" data-act="favorites" title="${t("favoritesTitle")}">${icon("star")}</button>
+      <div class="fp-fav-pop" hidden></div>
       <input class="fp-path" spellcheck="false" />
       <button class="icon-btn" data-act="mkdir" title="${t("mkdir")}">${icon("folderPlus")}</button>
       <button class="btn small ghost" data-act="downloadSel">${icon("download", 13)}${t("downloadSelected")}<span data-role="count"></span></button>
@@ -172,6 +180,85 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
   const downloadSelCount = downloadSelButton.querySelector<HTMLElement>("[data-role=count]")!;
   let lastEntries: DirEntry[] = [];
 
+  // panel-local view state: dotfile visibility (off by default) and the
+  // column sort (dirs always group first, matching every file manager)
+  let showHidden = false;
+  let sortKey: "name" | "size" | "time" = "name";
+  let sortAsc = true;
+  const hiddenButton = root.querySelector<HTMLElement>('[data-act="hidden"]')!;
+
+  // favorites live in the plugin settings keyed by connectionId
+  let favorites: string[] = [];
+  const favButton = root.querySelector<HTMLElement>('[data-act="favorites"]')!;
+  const favPop = root.querySelector<HTMLElement>(".fp-fav-pop")!;
+  void loadStyleSettings().then((settings) => {
+    favorites = connectionId ? (settings.favorites[connectionId] ?? []) : [];
+    syncFavButton();
+  });
+  onStyleSettingsChanged((settings) => {
+    favorites = connectionId ? (settings.favorites[connectionId] ?? []) : [];
+    syncFavButton();
+  });
+  function syncFavButton(): void {
+    favButton.classList.toggle("active", Boolean(cwd) && favorites.includes(cwd));
+  }
+  function saveFavorites(next: string[]): void {
+    favorites = next;
+    if (!connectionId) return;
+    void loadStyleSettings().then((settings) => {
+      const merged = { ...settings.favorites, [connectionId]: next };
+      if (next.length === 0) delete merged[connectionId];
+      void api("settings/put", { settings: { favorites: merged } }, 15000).catch(() => undefined);
+    });
+  }
+
+  function renderFavPop(): void {
+    favPop.innerHTML = "";
+    const currentSaved = Boolean(cwd) && favorites.includes(cwd);
+    const toggle = document.createElement("button");
+    toggle.className = "ctx-item";
+    toggle.textContent = currentSaved
+      ? `★ ${t("favoriteRemove")} (${cwd})`
+      : `☆ ${t("favoriteAdd")} (${cwd || "…"})`;
+    toggle.disabled = !cwd;
+    toggle.addEventListener("click", () => {
+      favPop.hidden = true;
+      if (!cwd) return;
+      saveFavorites(currentSaved ? favorites.filter((entry) => entry !== cwd) : [...favorites, cwd]);
+      syncFavButton();
+    });
+    favPop.append(toggle);
+    if (favorites.length > 0) {
+      const sep = document.createElement("div");
+      sep.className = "fav-sep";
+      favPop.append(sep);
+      for (const path of favorites) {
+        const entry = document.createElement("button");
+        entry.className = "ctx-item";
+        entry.textContent = path;
+        entry.title = path;
+        entry.addEventListener("click", () => {
+          favPop.hidden = true;
+          void load(path);
+        });
+        favPop.append(entry);
+      }
+    }
+  }
+  favButton.addEventListener("click", () => {
+    if (!favPop.hidden) {
+      favPop.hidden = true;
+      return;
+    }
+    renderFavPop();
+    favPop.hidden = false;
+  });
+  document.addEventListener("pointerdown", (event) => {
+    if (!favPop.hidden && !favPop.contains(event.target as Node) && event.target !== favButton) {
+      favPop.hidden = true;
+    }
+  });
+
   function updateSelectionUI(): void {
     downloadSelButton.hidden = selection.size === 0;
     downloadSelCount.textContent = selection.size > 0 ? ` (${selection.size})` : "";
@@ -200,6 +287,7 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
       pathInput.value = cwd;
       selection.clear();
       updateSelectionUI();
+      syncFavButton();
       renderList(result.entries);
     } catch (error: any) {
       if (seq === loadSeq) renderError(error.message);
@@ -214,9 +302,18 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
     listBox.append(empty);
   }
 
-  function renderList(entries: DirEntry[]): void {
-    lastEntries = entries;
+  function renderList(raw: DirEntry[]): void {
+    lastEntries = raw;
     listBox.innerHTML = "";
+    let entries = showHidden ? raw : raw.filter((entry) => !entry.name.startsWith("."));
+    // panel-local sort: directories always group first, then the active key
+    const dir = sortAsc ? 1 : -1;
+    entries = [...entries].sort((a, b) => {
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      if (sortKey === "size") return ((a.size - b.size) || a.name.localeCompare(b.name)) * dir;
+      if (sortKey === "time") return ((a.modTime - b.modTime) || a.name.localeCompare(b.name)) * dir;
+      return a.name.localeCompare(b.name) * dir;
+    });
     if (!entries.length) {
       const empty = document.createElement("div");
       empty.className = "fp-empty";
@@ -226,7 +323,21 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
     }
     const table = document.createElement("table");
     table.className = "fp-table";
-    table.innerHTML = "<thead><tr><th class=\"fp-check\"><input type=\"checkbox\" data-role=\"select-all\" /></th><th></th><th>名称</th><th>大小</th><th>修改时间</th><th></th></tr></thead>";
+    const arrow = (key: "name" | "size" | "time"): string =>
+      sortKey === key ? (sortAsc ? " ▲" : " ▼") : "";
+    table.innerHTML = `<thead><tr><th class="fp-check"><input type="checkbox" data-role="select-all" /></th><th></th><th data-sort="name">${t("colName")}${arrow("name")}</th><th data-sort="size">${t("colSize")}${arrow("size")}</th><th data-sort="time">${t("colTime")}${arrow("time")}</th><th></th></tr></thead>`;
+    table.querySelectorAll<HTMLElement>("th[data-sort]").forEach((th) => {
+      th.title = t("sortBy");
+      th.addEventListener("click", () => {
+        const key = th.dataset.sort as "name" | "size" | "time";
+        if (sortKey === key) sortAsc = !sortAsc;
+        else {
+          sortKey = key;
+          sortAsc = key === "name"; // name asc, size/time desc feel natural first
+        }
+        renderList(lastEntries);
+      });
+    });
     const body = document.createElement("tbody");
     const selectAll = table.querySelector<HTMLInputElement>("[data-role=select-all]")!;
     selectAll.addEventListener("change", () => {
@@ -414,20 +525,28 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
     return (async () => {
       const { transferId } = await api<{ transferId: string }>("transfer/startUpload", { shellId, remotePath: target, size: source.size }, 60000);
       item.transferId = transferId;
-      let offset = 0;
-      while (offset < source.size && !canceled) {
-        const chunk = await source.read(offset, Math.min(UPLOAD_CHUNK, source.size - offset));
-        sendBinary(`up/${transferId}`, chunk);
-        const event = await Promise.race([
-          waitForTransferEvent(transferId, 120000),
-        ]);
+      // pipelined dispatch: keep up to UPLOAD_WINDOW chunks in flight — the
+      // backend writes them concurrently (WriteAt), so large uploads no
+      // longer pay one RTT per chunk
+      let sendOffset = 0;
+      let ackedBytes = 0;
+      let outstanding = 0;
+      while (ackedBytes < source.size && !canceled) {
+        while (outstanding < UPLOAD_WINDOW && sendOffset < source.size) {
+          const chunk = await source.read(sendOffset, Math.min(UPLOAD_CHUNK, source.size - sendOffset));
+          sendBinary(`up/${transferId}`, chunk);
+          sendOffset += chunk.length;
+          outstanding += 1;
+        }
+        const event = await waitForTransferEvent(transferId, 120000);
         if (event.method === "transfer.done") {
           if (!event.params.ok) throw new Error(event.params.error || "upload failed");
-          offset = source.size;
+          ackedBytes = source.size;
           break;
         }
-        offset = (event.params?.received as number) ?? offset + chunk.length;
-        item.bytes = offset;
+        ackedBytes = Math.max(ackedBytes, (event.params?.received as number) ?? 0);
+        outstanding = Math.max(0, outstanding - 1);
+        item.bytes = ackedBytes;
         updateItem(item);
       }
       if (canceled) return;
@@ -721,6 +840,10 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
       notify(on ? (terminalCwd ? `${t("followOn")} · ${terminalCwd}` : t("followPending")) : t("followOff"), "info");
       // enabling follow lands on wherever the terminal already is
       if (on && terminalCwd && terminalCwd !== cwd) void load(terminalCwd);
+    } else if (action === "hidden") {
+      showHidden = !showHidden;
+      hiddenButton.classList.toggle("active", showHidden);
+      renderList(lastEntries);
     } else if (action === "downloadSel") {
       await downloadSelected();
     } else if (action === "mkdir") {
@@ -895,29 +1018,37 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
           <span class="spacer"></span>
           <button class="btn small" data-act="download-full">${icon("download", 13)}${t("editorDownload")}</button>
         </div>
-        <textarea class="editor-body" spellcheck="false" wrap="off"></textarea>
+        <div class="editor-body editor-code"></div>
       </div>
     `;
     const title = overlay.querySelector<HTMLElement>(".editor-title")!;
     const status = overlay.querySelector<HTMLElement>(".editor-status")!;
     const nav = overlay.querySelector<HTMLElement>(".editor-nav")!;
     const range = overlay.querySelector<HTMLElement>(".editor-range")!;
-    const area = overlay.querySelector<HTMLTextAreaElement>(".editor-body")!;
+    const editorBox = overlay.querySelector<HTMLElement>(".editor-body")!;
     const saveButton = overlay.querySelector<HTMLButtonElement>('[data-act="save"]')!;
     const reloadButton = overlay.querySelector<HTMLButtonElement>('[data-act="reload"]')!;
     title.textContent = path;
-    overlay.querySelector('[data-act="close"]')!.addEventListener("click", () => overlay.remove());
+    const editor = createCodeEditor(editorBox, path);
+    overlay.querySelector('[data-act="close"]')!.addEventListener("click", () => {
+      editor.dispose();
+      overlay.remove();
+    });
     overlay.addEventListener("pointerdown", (event) => {
-      if (event.target === overlay) overlay.remove();
+      if (event.target === overlay) {
+        editor.dispose();
+        overlay.remove();
+      }
     });
 
     let totalSize = 0;
     let offset = 0;
     let step = 1; // last served window size, updated per load
     let busy = false;
+    let readOnlyNow = true;
     const setBusy = (value: boolean): void => {
       busy = value;
-      saveButton.disabled = value || area.readOnly;
+      saveButton.disabled = value || readOnlyNow;
       reloadButton.disabled = value;
       nav.querySelectorAll<HTMLButtonElement>("button").forEach((button) => {
         button.disabled = value;
@@ -939,8 +1070,8 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
           windowed?: boolean;
         }>("fs/read", { shellId, path, offset: next }, 60000);
         if (result.binary) {
-          area.value = "";
-          area.readOnly = true;
+          editor.setDoc("", true);
+          readOnlyNow = true;
           nav.hidden = true;
           saveButton.hidden = true;
           status.textContent = t("editorBinary");
@@ -953,9 +1084,8 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
         // locally: the tail window reaches EOF but must stay read-only — an
         // editable partial view saved back would truncate the whole file.
         const windowed = totalSize > result.limit;
-        area.value = result.contentBase64 ? base64ToUtf8(result.contentBase64) : "";
-        // readOnly (not disabled): the text stays selectable and copyable
-        area.readOnly = windowed;
+        editor.setDoc(result.contentBase64 ? base64ToUtf8(result.contentBase64) : "", windowed);
+        readOnlyNow = windowed;
         saveButton.hidden = windowed;
         nav.hidden = !windowed;
         if (windowed) {
@@ -964,10 +1094,11 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
         } else {
           status.textContent = humanSize(totalSize);
         }
-        area.scrollTop = jumpEnd ? area.scrollHeight : 0;
+        if (jumpEnd) editor.scrollToEnd();
       } catch (error: any) {
         status.textContent = "";
         notify(`${t("editorLoadFail")}: ${error.message}`);
+        editor.dispose();
         overlay.remove();
         return;
       } finally {
@@ -988,11 +1119,11 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
     });
 
     const save = async (): Promise<void> => {
-      if (area.readOnly) return;
+      if (readOnlyNow) return;
       saveButton.disabled = true;
       status.textContent = t("connecting");
       try {
-        await api("fs/write", { shellId, path, contentBase64: utf8ToBase64(area.value) }, 120000);
+        await api("fs/write", { shellId, path, contentBase64: utf8ToBase64(editor.getValue()) }, 120000);
         status.textContent = t("editorSaved");
         void load();
       } catch (error: any) {
@@ -1003,13 +1134,10 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
       }
     };
     saveButton.addEventListener("click", () => void save());
-    reloadButton.addEventListener("click", () => void loadWindow(offset));
-    area.addEventListener("keydown", (event) => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
-        event.preventDefault();
-        if (!area.readOnly) void save();
-      }
+    editor.setSaveHandler(() => {
+      if (!readOnlyNow) void save();
     });
+    reloadButton.addEventListener("click", () => void loadWindow(offset));
     document.querySelector("#app")!.append(overlay);
     void loadWindow(0);
   }
@@ -1020,6 +1148,33 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
   // scrollback for free. Scroll lock: writing new output pins the view only
   // while the user is AT the bottom; scrolling up pauses following and shows
   // a "new output" pill, jumping back down resumes.
+  // Live filter: lines that do not contain the needle are dimmed (or hidden)
+  // from the moment the needle is set — already-written scrollback cannot be
+  // rewritten, so the filter applies to the stream, not the past.
+  class LogLineFilter {
+    needle = "";
+    hide = false;
+    private decoder = new TextDecoder();
+    private encoder = new TextEncoder();
+    private pending = "";
+    process(chunk: Uint8Array): Uint8Array {
+      if (this.needle === "") return chunk;
+      this.pending += this.decoder.decode(chunk, { stream: true });
+      const lines = this.pending.split("\n");
+      this.pending = lines.pop() ?? "";
+      const out: string[] = [];
+      const needle = this.needle.toLowerCase();
+      for (const line of lines) {
+        if (line.toLowerCase().includes(needle)) {
+          out.push(`${line}\n`);
+        } else if (!this.hide) {
+          out.push(`\x1b[90m${line}\x1b[39m\n`);
+        }
+      }
+      return this.encoder.encode(out.join(""));
+    }
+  }
+
   function openLogView(path: string): void {
     const overlay = document.createElement("div");
     overlay.className = "editor-overlay";
@@ -1028,6 +1183,9 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
         <div class="editor-head">
           <span class="editor-title"></span>
           <span class="editor-status"></span>
+          <input class="log-filter" data-act="filter" placeholder="${t("logFilterPlaceholder")}" spellcheck="false">
+          <button class="btn ghost small" data-act="mode" title="${t("logFilterModeTitle")}">${t("logFilterDim")}</button>
+          <button class="btn ghost small" data-act="color">${t("logColorLabel")}</button>
           <span class="spacer"></span>
           <button class="btn small log-jump" data-act="jump" hidden>↓ 0</button>
           <button class="btn ghost small" data-act="close">${t("editorClose")}</button>
@@ -1039,10 +1197,34 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
     const status = overlay.querySelector<HTMLElement>(".editor-status")!;
     const body = overlay.querySelector<HTMLElement>(".log-body")!;
     const jump = overlay.querySelector<HTMLButtonElement>('[data-act="jump"]')!;
+    const filterInput = overlay.querySelector<HTMLInputElement>('[data-act="filter"]')!;
+    const modeButton = overlay.querySelector<HTMLButtonElement>('[data-act="mode"]')!;
+    const colorButton = overlay.querySelector<HTMLButtonElement>('[data-act="color"]')!;
     title.textContent = path;
 
     const highlighter = new Highlighter({ enabled: true });
     const term = createTerminal(body);
+    const filter = new LogLineFilter();
+    // local color toggle on top of the plugin-wide setting: null = follow
+    // the settings broadcast; once toggled here it stays local to this view
+    let localColor: boolean | null = null;
+    let colorOn = true;
+    const syncColorButton = (): void => {
+      colorButton.classList.toggle("active", colorOn);
+    };
+    colorButton.addEventListener("click", () => {
+      colorOn = !colorOn;
+      localColor = colorOn;
+      highlighter.setEnabled(colorOn);
+      syncColorButton();
+    });
+    filterInput.addEventListener("input", () => {
+      filter.needle = filterInput.value.trim();
+    });
+    modeButton.addEventListener("click", () => {
+      filter.hide = !filter.hide;
+      modeButton.textContent = filter.hide ? t("logFilterOnly") : t("logFilterDim");
+    });
 
     let detachChannel: (() => void) | undefined;
     let detachSettings: (() => void) | undefined;
@@ -1066,14 +1248,18 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
 
     // live styling: apply current settings now and follow changes while open
     void loadStyleSettings().then((settings) => {
-      highlighter.setEnabled(settings.highlight);
+      colorOn = localColor ?? settings.highlight;
+      highlighter.setEnabled(colorOn);
       highlighter.setRules(settings.rules);
       term.setScheme(settings.scheme);
+      syncColorButton();
     });
     detachSettings = onStyleSettingsChanged((settings) => {
-      highlighter.setEnabled(settings.highlight);
+      colorOn = localColor ?? settings.highlight;
+      highlighter.setEnabled(colorOn);
       highlighter.setRules(settings.rules);
       term.setScheme(settings.scheme);
+      syncColorButton();
     });
 
     // scroll lock on the xterm viewport
@@ -1119,7 +1305,7 @@ export function createFilePanel(shellId: string, startDir?: string): FilePanel {
         // subscribe BEFORE ready: the follower emits nothing until tail/ready,
         // so no byte can be dropped by the demux
         detachChannel = onBinaryChannel(`tail/${taskId}`, (data) => {
-          const styled = highlighter.process(data);
+          const styled = filter.process(highlighter.process(data));
           term.write(styled);
           if (atBottom) {
             term.terminal.scrollToBottom();

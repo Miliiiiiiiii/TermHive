@@ -26,12 +26,12 @@ import (
 )
 
 const (
-	tailMaxPerConn    = 2                // live follow tasks per connection
-	tailBufferCap     = 256 * 1024       // unread bytes kept before dropping the head
-	tailIdleTimeout   = 2 * time.Minute  // no tail_read for this long → reclaim
-	tailStartGrace    = 1500 * time.Millisecond // immediate-exit detection window
-	tailLinesDefault  = 100
-	tailLinesMax      = 10000
+	tailMaxPerConn   = 2                       // live follow tasks per connection
+	tailBufferCap    = 256 * 1024              // unread bytes kept before dropping the head
+	tailIdleTimeout  = 2 * time.Minute         // no tail_read for this long → reclaim
+	tailStartGrace   = 1500 * time.Millisecond // immediate-exit detection window
+	tailLinesDefault = 100
+	tailLinesMax     = 10000
 )
 
 // tailBuffer accumulates unread output, keeping the TAIL when it overflows
@@ -154,7 +154,7 @@ var journalUnitPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.@:+\\-]*$`)
 
 // posixSingleQuote wraps s in single quotes, the one POSIX quoting form where
 // everything but the quote itself is literal; embedded quotes close, escape
-// and reopen ('\'' is the standard idiom). PowerShell/cmd connections are
+// and reopen ('\” is the standard idiom). PowerShell/cmd connections are
 // refused earlier, so POSIX rules are the only ones that apply.
 func posixSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"

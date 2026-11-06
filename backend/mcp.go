@@ -867,8 +867,8 @@ var mcpCatalog = []*mcpTool{
 		Handler:  mcpTailRead,
 	},
 	{
-		Name:     "tail_stop",
-		ReadOnly: true,
+		Name:        "tail_stop",
+		ReadOnly:    true,
 		Description: "Stop one follow task of the open connection and free its slot (each connection holds at most 2 live tasks).",
 		Properties: map[string]any{
 			"taskId": map[string]any{"type": "string", "description": "taskId returned by tail_start"},

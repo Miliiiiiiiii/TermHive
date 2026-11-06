@@ -11,6 +11,13 @@ import { DEFAULT_RULES, RULE_COLORS, RULE_COLOR_HEX, isRuleColor, type Highlight
 import { SCHEMES } from "./theme";
 import { api, onSidecarEvent } from "./rpc";
 
+/** one quick command: a name shown in the bar and the text sent to the PTY */
+export interface Snippet {
+  id: string;
+  name: string;
+  cmd: string;
+}
+
 export interface StyleSettings {
   scheme: string;
   highlight: boolean;
@@ -23,6 +30,16 @@ export interface StyleSettings {
   /** auto-remove finished transfer queue rows after this many seconds */
   transferAutoClose: boolean;
   transferAutoCloseDelay: number;
+  /** escape hatch: stop injecting the OSC 7 follow hook into new sessions */
+  disableShellIntegration: boolean;
+  /** quick commands bar (plugin-wide; shared through the settings blob) */
+  snippets: Snippet[];
+  /** terminal appearance: "" font = follow the host, sizes in px, scrollback in lines */
+  fontFamily: string;
+  fontSize: number;
+  scrollback: number;
+  /** saved file-panel paths per connectionId */
+  favorites: Record<string, string[]>;
 }
 
 export function defaultStyleSettings(): StyleSettings {
@@ -30,11 +47,17 @@ export function defaultStyleSettings(): StyleSettings {
     scheme: "auto",
     highlight: true,
     rules: DEFAULT_RULES.map((rule) => ({ ...rule })),
+    snippets: [],
     autoReconnect: true,
     autoReconnectMaxAttempts: 20,
     sessionLog: false,
     transferAutoClose: true,
     transferAutoCloseDelay: 3,
+    disableShellIntegration: false,
+    fontFamily: "",
+    fontSize: 13,
+    scrollback: 5000,
+    favorites: {},
   };
 }
 
@@ -47,6 +70,12 @@ type StoredSettings = {
   sessionLog?: boolean;
   transferAutoClose?: boolean;
   transferAutoCloseDelay?: number;
+  disableShellIntegration?: boolean;
+  snippets?: Snippet[];
+  fontFamily?: string;
+  fontSize?: number;
+  scrollback?: number;
+  favorites?: Record<string, string[]>;
 };
 
 function applyStored(settings: StyleSettings, stored: StoredSettings): void {
@@ -74,6 +103,32 @@ function applyStored(settings: StyleSettings, stored: StoredSettings): void {
   if (typeof stored.transferAutoClose === "boolean") settings.transferAutoClose = stored.transferAutoClose;
   if (typeof stored.transferAutoCloseDelay === "number" && Number.isFinite(stored.transferAutoCloseDelay)) {
     settings.transferAutoCloseDelay = Math.min(3600, Math.max(0, Math.round(stored.transferAutoCloseDelay)));
+  }
+  if (typeof stored.disableShellIntegration === "boolean") {
+    settings.disableShellIntegration = stored.disableShellIntegration;
+  }
+  if (Array.isArray(stored.snippets)) {
+    const snippets = stored.snippets.filter(
+      (snippet) => snippet && typeof snippet.name === "string" && typeof snippet.cmd === "string",
+    );
+    if (snippets.length > 0) settings.snippets = snippets;
+  }
+  if (typeof stored.fontFamily === "string") settings.fontFamily = stored.fontFamily.slice(0, 120);
+  if (typeof stored.fontSize === "number" && Number.isFinite(stored.fontSize)) {
+    settings.fontSize = Math.min(28, Math.max(9, Math.round(stored.fontSize)));
+  }
+  if (typeof stored.scrollback === "number" && Number.isFinite(stored.scrollback)) {
+    settings.scrollback = Math.min(100000, Math.max(500, Math.round(stored.scrollback)));
+  }
+  if (stored.favorites && typeof stored.favorites === "object" && !Array.isArray(stored.favorites)) {
+    const favorites: Record<string, string[]> = {};
+    for (const [key, value] of Object.entries(stored.favorites)) {
+      if (Array.isArray(value)) {
+        const paths = value.filter((entry) => typeof entry === "string");
+        if (paths.length > 0) favorites[key] = paths;
+      }
+    }
+    settings.favorites = favorites;
   }
 }
 
@@ -104,6 +159,12 @@ export function saveStyleSettings(settings: StyleSettings): void {
           sessionLog: settings.sessionLog,
           transferAutoClose: settings.transferAutoClose,
           transferAutoCloseDelay: settings.transferAutoCloseDelay,
+          disableShellIntegration: settings.disableShellIntegration,
+          snippets: settings.snippets,
+          fontFamily: settings.fontFamily,
+          fontSize: settings.fontSize,
+          scrollback: settings.scrollback,
+          favorites: settings.favorites,
         },
       },
       15000,
@@ -473,6 +534,43 @@ export function renderStylePop(
   schemeSelect.addEventListener("change", () => commit((draft) => (draft.scheme = schemeSelect.value)));
   settingCard(t("schemeLabel"), t("schemeDesc"), schemeSelect);
 
+  // terminal font: custom family ("" = follow the host) + size in px
+  {
+    const fontInput = document.createElement("input");
+    fontInput.type = "text";
+    fontInput.className = "stg-font";
+    fontInput.value = state.fontFamily;
+    fontInput.placeholder = t("fontFamilyPlaceholder");
+    fontInput.spellcheck = false;
+    fontInput.addEventListener("change", () =>
+      commit((draft) => (draft.fontFamily = fontInput.value.trim())),
+    );
+    const sizeInput = numberInput(
+      state.fontSize,
+      9,
+      28,
+      t("fontSizeTitle"),
+      (value) => commit((draft) => (draft.fontSize = value)),
+    );
+    const ctl = document.createElement("div");
+    ctl.className = "stg-ctl";
+    ctl.append(fontInput, sizeInput, unitSpan("px"));
+    settingCard(t("fontLabel"), t("fontDesc"), null).append(ctl);
+  }
+  {
+    const scrollInput = numberInput(
+      state.scrollback,
+      500,
+      100000,
+      t("scrollbackTitle"),
+      (value) => commit((draft) => (draft.scrollback = value)),
+    );
+    const ctl = document.createElement("div");
+    ctl.className = "stg-ctl";
+    ctl.append(scrollInput, unitSpan(t("linesUnit")));
+    settingCard(t("scrollbackLabel"), t("scrollbackDesc"), null).append(ctl);
+  }
+
   // auto-reconnect carries its give-up budget: after this many failed redials
   // the supervisor stops and the manual-reconnect overlay takes over (an
   // unreachable server would otherwise be retried forever)
@@ -517,6 +615,14 @@ export function renderStylePop(
     t("sessionLogLabel"),
     t("sessionLogDesc"),
     makeSwitch(state.sessionLog, (value) => commit((draft) => (draft.sessionLog = value))),
+  );
+
+  settingCard(
+    t("disableIntegrationLabel"),
+    t("disableIntegrationDesc"),
+    makeSwitch(state.disableShellIntegration, (value) =>
+      commit((draft) => (draft.disableShellIntegration = value)),
+    ),
   );
 
   // ---- highlight rules: one wide card, master switch in the header --------

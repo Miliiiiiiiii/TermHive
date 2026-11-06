@@ -30,6 +30,11 @@ type Conn struct {
 	shellKind  shellKind
 	promptBase string
 
+	// monitor sampling state: the previous /proc/stat reading the CPU
+	// percentage is differenced against (see monitor.go)
+	monitorMutex sync.Mutex
+	lastCpu      cpuCounters
+
 	closed atomic.Bool
 	dead   atomic.Bool
 	done   chan struct{}
@@ -79,7 +84,9 @@ func (conn *Conn) Close() {
 		conn.sftpClient = nil
 	}
 	conn.sftpMutex.Unlock()
-	conn.client.Close()
+	if conn.client != nil {
+		conn.client.Close()
+	}
 }
 
 func (conn *Conn) pumpKeepalive(emitter *dbxpluginsdk.Emitter) {

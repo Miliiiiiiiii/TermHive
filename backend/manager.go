@@ -38,12 +38,16 @@ var chunkBufPool = sync.Pool{
 
 // Transfer tracks one in-flight file move between the UI and a remote FS.
 // Uploads: UI streams chunks on channel up/<id>; the sidecar acks each chunk.
+// Large SFTP uploads run as a concurrent pipeline (uploadJobs): chunks are
+// queued in arrival order and written by workers through WriteAt, so the UI
+// can keep up to downOutstanding chunks in flight — the sequential per-chunk
+// ack round trip is what caps large uploads at one RTT per 128 KiB.
 // Downloads: the sidecar streams chunks on down/<id>, but only after the UI
 // confirms via transfer/ready that its channel subscription is live — the
 // UI-side demux drops frames nobody subscribed to; the UI acks each chunk
 // via transfer/ackDown, which throttles the pump to the bridge's throughput.
 // Written is written by pump goroutines and read by finishTransfer, so it is
-// atomic; done/Canceled/ready are only touched under Manager.mutex.
+// atomic; done/Canceled/ready/queuedBytes are only touched under Manager.mutex.
 type Transfer struct {
 	ID       string
 	ShellID  string
@@ -59,6 +63,17 @@ type Transfer struct {
 	readyCh  chan struct{}
 	doneCh   chan struct{}
 	cleanup  func()
+
+	// uploadJobs is non-nil only on the pipelined path; queuedBytes is the
+	// offset frontier handed out to incoming chunks (mutex-guarded).
+	uploadJobs  chan uploadJob
+	queuedBytes int64
+}
+
+// uploadJob is one queued chunk write for the pipelined upload path.
+type uploadJob struct {
+	offset int64
+	data   []byte
 }
 
 // Written snapshots the transfer progress for event reporting.
@@ -83,6 +98,16 @@ type Manager struct {
 	dataDir    string
 	hostKeys   *HostKeyStore
 
+	// dialFlights collapses concurrent dials of one connection id into a
+	// single DialConn (see conn).
+	dialFlights map[string]*dialFlight
+	// dialConn is the dial implementation behind conn(); a field so tests
+	// can substitute a controllable fake.
+	dialConn func(spec ConnSpec, emitter *dbxpluginsdk.Emitter, hostKeys *HostKeyStore) (*Conn, error)
+	// specsFileMutex serializes this process's read-modify-write cycles on
+	// specs.json; the cross-process half is the .lock lockfile.
+	specsFileMutex sync.Mutex
+
 	diagMutex sync.Mutex
 
 	emitterMutex sync.Mutex
@@ -91,15 +116,17 @@ type Manager struct {
 
 func NewManager(dataDir string) *Manager {
 	manager := &Manager{
-		shells:     map[string]*Shell{},
-		conns:      map[string]*Conn{},
-		transfers:  map[string]*Transfer{},
-		tailTasks:  map[string]*tailTask{},
-		followers:  map[string]*logFollower{},
-		reconnects: map[string]chan struct{}{},
-		specs:      map[string]ConnSpec{},
-		dataDir:    dataDir,
-		hostKeys:   NewHostKeyStore(dataDir),
+		shells:      map[string]*Shell{},
+		conns:       map[string]*Conn{},
+		transfers:   map[string]*Transfer{},
+		tailTasks:   map[string]*tailTask{},
+		followers:   map[string]*logFollower{},
+		reconnects:  map[string]chan struct{}{},
+		specs:       map[string]ConnSpec{},
+		dataDir:     dataDir,
+		hostKeys:    NewHostKeyStore(dataDir),
+		dialFlights: map[string]*dialFlight{},
+		dialConn:    DialConn,
 	}
 	if dataDir != "" {
 		_ = os.MkdirAll(dataDir, 0o700)
@@ -121,7 +148,7 @@ func (manager *Manager) loadSpecs() {
 	manager.specs = specs
 	if legacy {
 		// Legacy plaintext (pre-0.4.5): seal it immediately.
-		manager.persistSpecs()
+		manager.upsertSpecsToDisk(specs)
 	}
 }
 
@@ -200,36 +227,99 @@ func (manager *Manager) writeDiag(line string) {
 	fmt.Fprintf(file, "%s %s\n", time.Now().Format("15:04:05.000"), line)
 }
 
-// persistSpecsLocked flushes the credential cache; caller holds the mutex.
-// The file is sealed at rest (DPAPI on Windows, AES-GCM elsewhere): plaintext
-// lives only in memory, which is what "passwords stay recoverable" actually
-// needs, while a stolen data dir alone no longer yields credentials. On seal
-// failure the flush is skipped rather than falling back to plaintext.
-func (manager *Manager) persistSpecsLocked() {
+// applySpecsToDisk flushes a change to the credential cache as a locked
+// read-modify-write cycle: the workbench and the MCP bridge each run their own
+// sidecar of this plugin against the same dataDir, and the previous
+// whole-map overwrite dropped whatever the other sidecar had flushed in the
+// meantime (a field incident left the disk holding a single spec). The change
+// is computed against the on-disk state, so entries only the other sidecar
+// knows survive; the file stays sealed at rest (DPAPI on Windows, AES-GCM
+// elsewhere) and is replaced atomically. On seal failure the flush is skipped
+// rather than falling back to plaintext.
+func (manager *Manager) applySpecsToDisk(apply func(disk map[string]ConnSpec) map[string]ConnSpec) {
 	if manager.dataDir == "" {
 		return
 	}
-	raw, err := json.MarshalIndent(manager.specs, "", "  ")
-	if err != nil {
-		return
-	}
-	sealed, err := manager.sealSpecs(raw)
-	if err != nil {
-		manager.writeDiag("specs.json 加密失败, 跳过本次落盘: " + err.Error())
-		return
-	}
-	temp := manager.specsPath() + ".tmp"
-	if os.WriteFile(temp, sealed, 0o600) != nil {
-		return
-	}
-	_ = os.Rename(temp, manager.specsPath())
+	manager.specsFileMutex.Lock()
+	defer manager.specsFileMutex.Unlock()
+	manager.withSpecsFileLock(func() {
+		disk, _, ok := manager.readSpecsFile()
+		if !ok {
+			disk = map[string]ConnSpec{}
+		}
+		merged := apply(disk)
+		raw, err := json.MarshalIndent(merged, "", "  ")
+		if err != nil {
+			return
+		}
+		sealed, err := manager.sealSpecs(raw)
+		if err != nil {
+			manager.writeDiag("specs.json 加密失败, 跳过本次落盘: " + err.Error())
+			return
+		}
+		temp := manager.specsPath() + ".tmp"
+		if os.WriteFile(temp, sealed, 0o600) != nil {
+			return
+		}
+		_ = os.Rename(temp, manager.specsPath())
+	})
 }
 
-// persistSpecs is persistSpecsLocked for callers without the mutex held.
-func (manager *Manager) persistSpecs() {
-	manager.mutex.Lock()
-	defer manager.mutex.Unlock()
-	manager.persistSpecsLocked()
+// upsertSpecsToDisk merges the given specs into the on-disk cache without
+// touching entries only the other sidecar wrote.
+func (manager *Manager) upsertSpecsToDisk(specs map[string]ConnSpec) {
+	if len(specs) == 0 {
+		return
+	}
+	manager.applySpecsToDisk(func(disk map[string]ConnSpec) map[string]ConnSpec {
+		for id, spec := range specs {
+			disk[id] = spec
+		}
+		return disk
+	})
+}
+
+// removeSpecFromDisk drops one entry from the on-disk cache (disconnect).
+func (manager *Manager) removeSpecFromDisk(id string) {
+	manager.applySpecsToDisk(func(disk map[string]ConnSpec) map[string]ConnSpec {
+		delete(disk, id)
+		return disk
+	})
+}
+
+// specsLockStale is how old a specs.json.lock may look before a waiter
+// assumes the holder crashed and takes the lock over. Real write cycles are
+// milliseconds; this only needs to outlive a wedged process.
+const specsLockStale = 30 * time.Second
+
+// withSpecsFileLock serializes cross-process read-modify-write cycles on
+// specs.json through a lockfile (exclusive create). A crashed holder leaves
+// the file behind; past specsLockStale it is treated as orphaned and removed.
+// If the lock cannot be acquired within ~5s the write proceeds anyway — no
+// worse than the previous unlocked behavior, and both sidecars writing at the
+// same instant remains a millisecond window instead of a session-long one.
+func (manager *Manager) withSpecsFileLock(fn func()) {
+	lockPath := manager.specsPath() + ".lock"
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			_ = file.Close()
+			defer func() { _ = os.Remove(lockPath) }()
+			break
+		}
+		if info, statErr := os.Stat(lockPath); statErr == nil && time.Since(info.ModTime()) > specsLockStale {
+			// Orphaned lock from a crashed holder — take it over.
+			_ = os.Remove(lockPath)
+			continue
+		}
+		if time.Now().After(deadline) {
+			manager.writeDiag("specs.json 跨进程锁等待超时, 降级为无锁写入")
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	fn()
 }
 
 func (manager *Manager) setEmitter(emitter *dbxpluginsdk.Emitter) {
@@ -374,13 +464,48 @@ func (manager *Manager) StartUpload(shellID, remotePath string, size int64) (str
 		sink:     sink,
 		doneCh:   make(chan struct{}),
 	}
+	// SFTP file handles implement WriterAt: large uploads run as a stripe
+	// pipeline like the download side (UseConcurrentWrites is on). Small
+	// uploads and plain sinks stay on the sequential path.
+	if writerAt, ok := sink.(io.WriterAt); ok && size > downChunk {
+		transfer.uploadJobs = make(chan uploadJob, downOutstanding)
+		for i := 0; i < downWorkers; i++ {
+			go manager.uploadWorker(transfer, writerAt)
+		}
+	}
 	manager.mutex.Lock()
 	manager.transfers[transfer.ID] = transfer
 	manager.mutex.Unlock()
 	return transfer.ID, nil
 }
 
-// UploadChunk persists one chunk and reports total written.
+// uploadWorker drains the upload stripe queue, writing each chunk at its
+// arrival-order offset and acking on completion (received is the monotonic
+// total written, any order). First error finishes the transfer; late chunks
+// fail harmlessly against the closed handle and finishTransfer is idempotent.
+func (manager *Manager) uploadWorker(transfer *Transfer, writerAt io.WriterAt) {
+	for {
+		select {
+		case job := <-transfer.uploadJobs:
+			if _, err := writerAt.WriteAt(job.data, job.offset); err != nil {
+				manager.finishTransfer(transfer.ID, err)
+				return
+			}
+			written := transfer.written.Add(int64(len(job.data)))
+			manager.emit("transfer.ack", map[string]any{"transferId": transfer.ID, "received": written})
+			if transfer.Expected > 0 && written >= transfer.Expected {
+				manager.finishTransfer(transfer.ID, nil)
+				return
+			}
+		case <-transfer.doneCh:
+			return
+		}
+	}
+}
+
+// UploadChunk persists one chunk and reports total written. On the pipelined
+// path the chunk is queued (arrival order = its offset) and written
+// concurrently; the ack fires from the worker when the bytes are on the wire.
 func (manager *Manager) UploadChunk(transferID string, data []byte) error {
 	manager.mutex.Lock()
 	transfer := manager.transfers[transferID]
@@ -391,6 +516,22 @@ func (manager *Manager) UploadChunk(transferID string, data []byte) error {
 	}
 	if finished {
 		return errors.New("transfer already finished: " + transferID)
+	}
+	if transfer.uploadJobs != nil {
+		// the bridge recycles the frame buffer once this handler returns and
+		// the write happens later on a worker — the bytes must be copied
+		buf := make([]byte, len(data))
+		copy(buf, data)
+		manager.mutex.Lock()
+		offset := transfer.queuedBytes
+		transfer.queuedBytes += int64(len(buf))
+		manager.mutex.Unlock()
+		select {
+		case transfer.uploadJobs <- uploadJob{offset: offset, data: buf}:
+		case <-transfer.doneCh:
+			return errors.New("transfer already finished: " + transferID)
+		}
+		return nil
 	}
 	count, err := transfer.sink.Write(data)
 	if err != nil {

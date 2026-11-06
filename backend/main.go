@@ -155,6 +155,26 @@ func (app *plugin) handle(
 		app.manager.SetSettings(settings)
 		return map[string]any{"ok": true}, nil
 
+	// ---- last session layout (one-click workspace restore) ----
+
+	case "monitor/sample":
+		sample, pluginError := app.manager.SampleMonitor(str(values["connectionId"]), emitter)
+		if pluginError != nil {
+			return nil, pluginError
+		}
+		return sample, nil
+
+	case "workspace/get":
+		return map[string]any{"workspace": app.manager.GetWorkspace()}, nil
+
+	case "workspace/put":
+		payload, _ := values["workspace"].(map[string]any)
+		if payload == nil {
+			payload = map[string]any{}
+		}
+		app.manager.SetWorkspace(payload)
+		return map[string]any{"ok": true}, nil
+
 	// ---- recorded server fingerprints (TOFU known_hosts management) ----
 
 	case "hostkey/list":

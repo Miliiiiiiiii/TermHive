@@ -176,6 +176,18 @@ try {
   const connList = await call("connection/list");
   expect(Array.isArray(connList.connections), "connection/list returns a list without credentials");
 
+  const workspaceEmpty = await call("workspace/get");
+  expect(workspaceEmpty.workspace && typeof workspaceEmpty.workspace === "object", "workspace/get returns an object");
+  const layout = { v: 1, savedAt: Date.now(), tabs: [{ connectionId: "c1", title: "s1" }], groups: [] };
+  await call("workspace/put", { workspace: layout });
+  const workspaceBack = await call("workspace/get");
+  expect(
+    workspaceBack.workspace &&
+      Array.isArray(workspaceBack.workspace.tabs) &&
+      workspaceBack.workspace.tabs[0].title === "s1",
+    "workspace/put → get round-trips the layout",
+  );
+
   console.log("\nprotocol smoke test passed");
   child.kill();
   process.exit(0);

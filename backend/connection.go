@@ -209,8 +209,8 @@ func (manager *Manager) ConnectConnection(request LifecycleRequest, emitter *dbx
 	}
 	manager.mutex.Lock()
 	manager.specs[spec.ConnectionID] = spec
-	manager.persistSpecsLocked()
 	manager.mutex.Unlock()
+	manager.upsertSpecsToDisk(map[string]ConnSpec{spec.ConnectionID: spec})
 	shellID, dialErr := manager.dial(conn, 80, 24, emitter)
 	if dialErr != nil {
 		return nil, dbxpluginsdk.NewError(-32002, dialErr.Error())
@@ -232,8 +232,8 @@ func (manager *Manager) DisconnectConnection(request LifecycleRequest) {
 	conn := manager.conns[connectionID]
 	delete(manager.conns, connectionID)
 	delete(manager.specs, connectionID)
-	manager.persistSpecsLocked()
 	manager.mutex.Unlock()
+	manager.removeSpecFromDisk(connectionID)
 	for _, id := range shellIDs {
 		manager.CloseShell(id)
 	}
@@ -346,47 +346,104 @@ func (manager *Manager) NewShellForConnection(connectionID string, cols, rows in
 	return connectionInfo(conn.Spec, shellID), nil
 }
 
+// dialFlight collapses concurrent dials for one connection id into a single
+// DialConn. Without it, simultaneous first calls (parallel MCP tool calls on
+// a cold sidecar) each dial their own client and then close each other's via
+// the old-entry swap — "unexpected packet in response to channel open".
+type dialFlight struct {
+	spec ConnSpec
+	done chan struct{}
+	err  error
+}
+
 // conn returns the live shared SSH connection for an id, dialing it (again)
 // when the host has no live client — e.g. after a sidecar restart. The spec
 // to dial with is supplied by the caller when known (lifecycle payloads carry
-// it), falling back to the cached spec otherwise.
+// it), falling back to the cached spec otherwise. Concurrent calls for the
+// same id share one dial (dialFlights); a caller whose known spec points at a
+// different endpoint than the in-flight dial waits one round and dials its
+// own endpoint (cross-wired cache replacement, at most one extra round).
 func (manager *Manager) conn(connectionID string, emitter *dbxpluginsdk.Emitter, known ...ConnSpec) (*Conn, error) {
-	manager.mutex.Lock()
-	cached := manager.conns[connectionID]
-	manager.mutex.Unlock()
-	if cached != nil && !cached.Dead() {
-		if len(known) == 0 || sameEndpoint(cached.Spec, known[0]) {
-			return cached, nil
+	for round := 0; ; round++ {
+		manager.mutex.Lock()
+		cached := manager.conns[connectionID]
+		manager.mutex.Unlock()
+		if cached != nil && !cached.Dead() {
+			if len(known) == 0 || sameEndpoint(cached.Spec, known[0]) {
+				return cached, nil
+			}
+			// The live client points at another server than the spec the caller
+			// holds — a cross-wired entry; replace it below rather than hand it out.
+			manager.writeDiag(fmt.Sprintf("conn %s: cached client is %s@%s:%d but the spec says %s@%s:%d, redialing",
+				connectionID, cached.Spec.Username, cached.Spec.Host, cached.Spec.Port,
+				known[0].Username, known[0].Host, known[0].Port))
 		}
-		// The live client points at another server than the spec the caller
-		// holds — a cross-wired entry; replace it below rather than hand it out.
-		manager.writeDiag(fmt.Sprintf("conn %s: cached client is %s@%s:%d but the spec says %s@%s:%d, redialing",
-			connectionID, cached.Spec.Username, cached.Spec.Host, cached.Spec.Port,
-			known[0].Username, known[0].Host, known[0].Port))
+		var spec ConnSpec
+		var ok bool
+		if len(known) > 0 {
+			spec, ok = known[0], true
+		} else {
+			spec, ok = manager.findSpec(connectionID)
+		}
+		if !ok {
+			return nil, errors.New("连接尚未建立: 请在左侧连接列表断开后重新双击该连接")
+		}
+
+		manager.mutex.Lock()
+		flight := manager.dialFlights[connectionID]
+		if flight == nil {
+			flight = &dialFlight{spec: spec, done: make(chan struct{})}
+			manager.dialFlights[connectionID] = flight
+			manager.mutex.Unlock()
+			// leader: dial, then publish the result to every waiter.
+			conn, err := manager.dialConn(spec, emitter, manager.hostKeys)
+			if err != nil {
+				manager.mutex.Lock()
+				delete(manager.dialFlights, connectionID)
+				flight.err = err
+				close(flight.done)
+				manager.mutex.Unlock()
+				return nil, err
+			}
+			conn.onDead = func() { manager.notifyConnectionTrouble(connectionID) }
+			manager.mutex.Lock()
+			old := manager.conns[connectionID]
+			manager.conns[connectionID] = conn
+			delete(manager.dialFlights, connectionID)
+			flight.err = nil
+			close(flight.done)
+			manager.mutex.Unlock()
+			if old != nil {
+				old.Close()
+			}
+			return conn, nil
+		}
+		manager.mutex.Unlock()
+
+		// waiter: piggyback on the leader's dial.
+		if len(known) > 0 && !sameEndpoint(flight.spec, known[0]) {
+			// The in-flight dial targets another server; let it land, then
+			// redial ours (the swap below replaces the cross-wired client).
+			<-flight.done
+			if round >= 1 {
+				return nil, errors.New("连接正在建立中, 请稍后重试")
+			}
+			continue
+		}
+		<-flight.done
+		if flight.err != nil {
+			return nil, flight.err
+		}
+		manager.mutex.Lock()
+		conn := manager.conns[connectionID]
+		manager.mutex.Unlock()
+		if conn != nil && !conn.Dead() && (len(known) == 0 || sameEndpoint(conn.Spec, known[0])) {
+			return conn, nil
+		}
+		if round >= 1 {
+			return nil, errors.New("连接在建立过程中断开, 请重试")
+		}
 	}
-	var spec ConnSpec
-	var ok bool
-	if len(known) > 0 {
-		spec, ok = known[0], true
-	} else {
-		spec, ok = manager.findSpec(connectionID)
-	}
-	if !ok {
-		return nil, errors.New("连接尚未建立: 请在左侧连接列表断开后重新双击该连接")
-	}
-	conn, err := DialConn(spec, emitter, manager.hostKeys)
-	if err != nil {
-		return nil, err
-	}
-	conn.onDead = func() { manager.notifyConnectionTrouble(connectionID) }
-	manager.mutex.Lock()
-	old := manager.conns[connectionID]
-	manager.conns[connectionID] = conn
-	manager.mutex.Unlock()
-	if old != nil {
-		old.Close()
-	}
-	return conn, nil
 }
 
 // dial opens one PTY session over the connection's shared client. The shell
@@ -404,8 +461,24 @@ func (manager *Manager) dial(conn *Conn, cols, rows int, emitter *dbxpluginsdk.E
 	if manager.sessionLogEnabled() {
 		manager.attachSessionLog(shell)
 	}
-	manager.injectFollowHook(conn, shell)
+	if !manager.shellIntegrationDisabled() {
+		manager.injectFollowHook(conn, shell)
+	} else {
+		manager.writeDiag("follow hook: shell integration disabled by setting, skipping injection for " + shell.ID)
+	}
 	return shell.ID, nil
+}
+
+// shellIntegrationDisabled is the escape hatch for the OSC 7 injection: with
+// it on, no hook bytes are typed into any new PTY at all (echo hiding,
+// follow — all of it), so a server where the injection misbehaves can be
+// used cleanly. Existing sessions are unaffected; the file panel's follow
+// simply has no cwd signal while this is on.
+func (manager *Manager) shellIntegrationDisabled() bool {
+	manager.mutex.Lock()
+	defer manager.mutex.Unlock()
+	value, ok := manager.settings["disableShellIntegration"].(bool)
+	return ok && value
 }
 
 // injectFollowHook installs the OSC 7 cwd hook into a freshly opened PTY so

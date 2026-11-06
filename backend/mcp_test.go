@@ -244,11 +244,12 @@ func TestConnRejectsCrossWiredCache(t *testing.T) {
 func TestCachedSpecRefreshesFromDisk(t *testing.T) {
 	dir := t.TempDir()
 	writer := NewManager(dir)
-	writer.mutex.Lock()
-	writer.specs["conn-new"] = ConnSpec{ConnectionID: "conn-new", Host: "10.0.0.9", Port: 22, Username: "root",
+	specNew := ConnSpec{ConnectionID: "conn-new", Host: "10.0.0.9", Port: 22, Username: "root",
 		Auth: AuthConfig{Method: "password", Password: "s"}}
-	writer.persistSpecsLocked()
+	writer.mutex.Lock()
+	writer.specs["conn-new"] = specNew
 	writer.mutex.Unlock()
+	writer.upsertSpecsToDisk(map[string]ConnSpec{"conn-new": specNew})
 
 	reader := NewManager(dir)
 	reader.specs = map[string]ConnSpec{"conn-old": {ConnectionID: "conn-old", Host: "127.0.0.1", Port: 22, Username: "gordo"}}

@@ -76,21 +76,21 @@ func TestReadOnlyRejectsThroughQuotes(t *testing.T) {
 		command string
 		kind    shellKind
 	}{
-		"quoted -delete reaches find":          {`find /tmp -name x "-delete"`, kindBash},
-		"single-quoted -delete reaches find":   {`find /tmp -name x '-delete'`, kindBash},
-		"quoted -f reaches tail":               {`tail "-f" /var/log/syslog`, kindUnknown},
-		"$( expands inside double quotes":      {`echo "$(whoami)"`, kindBash},
+		"quoted -delete reaches find":           {`find /tmp -name x "-delete"`, kindBash},
+		"single-quoted -delete reaches find":    {`find /tmp -name x '-delete'`, kindBash},
+		"quoted -f reaches tail":                {`tail "-f" /var/log/syslog`, kindUnknown},
+		"$( expands inside double quotes":       {`echo "$(whoami)"`, kindBash},
 		"backtick expands inside double quotes": {"echo \"`whoami`\"", kindBash},
-		"$( outside quotes":                    {`echo $(whoami)`, kindCmd},
-		"redirect outside quotes":              {`cat x > /tmp/y`, kindBash},
-		"redirect after a quoted word":         {`cat "x" > /tmp/y`, kindBash},
-		"cmd: single quotes do not protect |":  {`findstr 'a | del b' x`, kindCmd},
-		"cmd: backslash does not escape |":     {`dir a\| del b`, kindCmd},
+		"$( outside quotes":                     {`echo $(whoami)`, kindCmd},
+		"redirect outside quotes":               {`cat x > /tmp/y`, kindBash},
+		"redirect after a quoted word":          {`cat "x" > /tmp/y`, kindBash},
+		"cmd: single quotes do not protect |":   {`findstr 'a | del b' x`, kindCmd},
+		"cmd: backslash does not escape |":      {`dir a\| del b`, kindCmd},
 		"unknown: single quotes do not protect": {`grep 'a|rm -rf /tmp' x`, kindUnknown},
-		"unterminated double quote":            {`echo "unclosed`, kindBash},
-		"unterminated single quote":            {`echo 'unclosed`, kindBash},
-		"trailing backslash":                   {`ls \`, kindBash},
-		"chained program after quotes":         {`cat "a;b"; rm x`, kindBash},
+		"unterminated double quote":             {`echo "unclosed`, kindBash},
+		"unterminated single quote":             {`echo 'unclosed`, kindBash},
+		"trailing backslash":                    {`ls \`, kindBash},
+		"chained program after quotes":          {`cat "a;b"; rm x`, kindBash},
 	}
 	for name, tc := range cases {
 		if err := isReadOnlyCommandFor(tc.command, tc.kind); err == nil {

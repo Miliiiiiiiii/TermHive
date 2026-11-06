@@ -77,7 +77,7 @@ func TestHideWindowMarkerSplitAcrossFlushes(t *testing.T) {
 		"TEST-BANNER\r\nECHO:",
 		" __osc7",                 // marker split: first half
 		"(){ printf hook stuff\r", // marker complete; line still open
-		"\nmore-output\r\n",      // echo line closed — dropped
+		"\nmore-output\r\n",       // echo line closed — dropped
 		testOsc7 + "/x\x1b\\AFTER",
 	})
 	if !strings.Contains(got, "TEST-BANNER") {
