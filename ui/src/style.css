@@ -452,8 +452,7 @@ input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):focus, selec
 .restore-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .restore-bar .btn { height: 24px; padding: 0 10px; font-size: 12px; display: inline-flex; align-items: center; gap: 5px; }
 
-/* server monitor pop: rows of label/value + thin bars; CPU sparkline canvas */
-.monitor-pop { min-width: 300px; max-height: 420px; }
+/* server monitor pop: rows of label/value + thin bars; CPU sparkline canvas */.monitor-pop { min-width: 300px; max-height: 420px; }
 .mon-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px 3px; font-size: 12px; }
 .mon-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
 .mon-value { flex: none; color: var(--text-dim); font-variant-numeric: tabular-nums; }
@@ -1091,3 +1090,34 @@ input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):focus, selec
 /* refresh feedback: spin the icon while the listing reloads */
 @keyframes fp-spin { to { transform: rotate(360deg); } }
 .icon-btn.spin .ic { animation: fp-spin 0.45s ease; }
+
+/* ---- ZMODEM transfer window (Xshell-style progress card, bottom-right) ---- */
+.zm-transfers {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  z-index: 45;
+  width: 320px;
+  max-height: 300px;
+  overflow-y: auto;
+  padding: 8px 10px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.4);
+}
+.zm-head { font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
+.zm-row { padding: 4px 0 6px; }
+.zm-row + .zm-row { border-top: 1px solid var(--border-soft); }
+.zm-line { display: flex; align-items: center; gap: 8px; }
+.zm-name { flex: 1; min-width: 0; font-size: 12px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.zm-meta { flex: none; font-size: 11px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.zm-cancel {
+  flex: none; width: 20px; height: 20px; border: none; border-radius: 5px;
+  background: transparent; color: var(--text-dim); font-size: 14px; line-height: 1; cursor: pointer;
+}
+.zm-cancel:hover { background: var(--bg-hover); color: var(--danger); }
+.zm-bar { height: 4px; margin-top: 4px; border-radius: 2px; background: var(--border-soft); overflow: hidden; }
+.zm-bar span { display: block; height: 100%; border-radius: 2px; background: var(--accent); transition: width 0.15s; }
+.zm-bar span.zm-ok { background: var(--ok, #3fb950); }
+.zm-finished .zm-name { color: var(--text-dim); }

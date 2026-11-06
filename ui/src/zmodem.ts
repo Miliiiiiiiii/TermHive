@@ -4,8 +4,11 @@
 // a ZMODEM session (the user typed `rz` or `sz` on the server) are peeled
 // off into a transfer — everything else flows through untouched, and it does
 // so BEFORE the highlighter, because protocol frames must never be
-// ANSI-re-encoded. Uploading (`rz`) reads host-picked files chunk by chunk;
-// downloading (`sz`) streams offer payloads into a host save handle.
+// ANSI-re-encoded.
+//
+// Progress UI (Xshell-style transfer window) is owned by the session view:
+// this module only reports the live transfer list through onTransfers and
+// accepts cancel()/dismiss() calls.
 //
 // Screen hygiene: zmodem.js's Sentry DELIBERATELY forwards the initial
 // ZRQINIT/ZRINIT frame, any "garbage" it parses mid-session, and everything
@@ -27,6 +30,14 @@ const READ_CHUNK = 64 * 1024;
 // lrzsz keeps re-sending headers for a while after an abort
 const SUPPRESS_MS = 15000;
 
+export interface ZmodemTransferItem {
+  id: number;
+  name: string;
+  size: number;
+  bytes: number;
+  status: "active" | "done" | "failed" | "canceled";
+}
+
 export interface ZmodemHooks {
   /** passthrough for non-protocol bytes (the normal terminal path) */
   writeTerm(data: Uint8Array): void;
@@ -35,6 +46,17 @@ export interface ZmodemHooks {
   notify(text: string, kind?: "info" | "error"): void;
   /** forensic logging into the sidecar's diag.log */
   diag?(line: string): void;
+  /** live transfer list for the progress window (throttled ~100ms) */
+  onTransfers?(items: ZmodemTransferItem[]): void;
+}
+
+export interface ZmodemSentryHandle {
+  consume(data: Uint8Array): void;
+  dispose(): void;
+  /** cancel one transfer: receive skips the file in-protocol, send aborts the session */
+  cancel(id: number): void;
+  /** drop a finished item from the reported list (auto-close housekeeping) */
+  dismiss(id: number): void;
 }
 
 function toUint8(octets: number[] | Uint8Array | string): Uint8Array {
@@ -78,12 +100,8 @@ async function readHandleChunk(handle: FileHandle, offset: number, length: numbe
     : Uint8Array.from(atob(chunk.dataBase64), (c) => c.charCodeAt(0));
 }
 
-// createZmodemSentry builds the per-tab stream fork. consume() receives every
-// terminal output chunk first; dispose aborts any live transfer.
-export function createZmodemSentry(hooks: ZmodemHooks): {
-  consume(data: Uint8Array): void;
-  dispose(): void;
-} {
+// createZmodemSentry builds the per-tab stream fork.
+export function createZmodemSentry(hooks: ZmodemHooks): ZmodemSentryHandle {
   let session: any = null;
   let disposed = false;
   let suppressUntil = 0;
@@ -94,6 +112,26 @@ export function createZmodemSentry(hooks: ZmodemHooks): {
   const diag = (line: string): void => hooks.diag?.(line);
   const armCooldown = (): void => {
     denyUntil = Date.now() + SUPPRESS_MS;
+  };
+
+  // ---- transfer list (progress window feed) ----
+  let transferSeq = 0;
+  let items: ZmodemTransferItem[] = [];
+  const offers = new Map<number, any>(); // receive-side xfer per item id
+  let sendAbortRequested = false;
+  let emitTimer = 0;
+  const emit = (): void => {
+    if (emitTimer) return;
+    emitTimer = window.setTimeout(() => {
+      emitTimer = 0;
+      hooks.onTransfers?.([...items]);
+    }, 100);
+  };
+  const upsert = (item: ZmodemTransferItem): void => {
+    const index = items.findIndex((entry) => entry.id === item.id);
+    if (index === -1) items.push(item);
+    else items[index] = item;
+    emit();
   };
 
   const sentry = new Zmodem.Sentry({
@@ -127,8 +165,9 @@ export function createZmodemSentry(hooks: ZmodemHooks): {
         return;
       }
       session = zsession;
+      sendAbortRequested = false;
       diag(`session confirmed role=${zsession.type}`);
-      void runSession(zsession, hooks, plugin, diag, armCooldown)
+      void runSession(zsession)
         .catch((error: any) => diag("session error: " + String(error?.message ?? error)))
         .finally(() => {
           session = null;
@@ -140,6 +179,130 @@ export function createZmodemSentry(hooks: ZmodemHooks): {
         });
     },
   });
+
+  async function runSession(zsession: any): Promise<void> {
+    try {
+      if (zsession.type === "send") {
+        // `rz` on the server: it waits for us to send files.
+        const files = await pickZmodemFiles();
+        if (!files || files.length === 0) {
+          hooks.notify("rz: 未选择文件，传输取消", "info");
+          diag("send: no files picked, aborting");
+          armCooldown();
+          zsession.abort();
+          return;
+        }
+        for (const handle of files) {
+          const size = handleFileSize(handle) ?? 0;
+          const name = handleFileName(handle);
+          const item: ZmodemTransferItem = { id: ++transferSeq, name, size, bytes: 0, status: "active" };
+          upsert(item);
+          const xfer = await zsession.send_offer({
+            name,
+            size,
+            mode: 0o644,
+            mtime: Math.floor(Date.now() / 1000),
+          });
+          if (!xfer) {
+            upsert({ ...item, status: "canceled" });
+            continue; // peer skipped
+          }
+          let offset = 0;
+          while (offset < size) {
+            if (sendAbortRequested) break;
+            const chunk = await readHandleChunk(handle, offset, Math.min(READ_CHUNK, size - offset));
+            if (chunk.length === 0) break;
+            xfer.send(chunk);
+            offset += chunk.length;
+            upsert({ ...item, bytes: offset });
+          }
+          if (sendAbortRequested) {
+            upsert({ ...item, status: "canceled", bytes: offset });
+            zsession.abort();
+            return;
+          }
+          await xfer.end();
+          upsert({ ...item, status: "done", bytes: size });
+          diag(`send: ${name} complete (${size} bytes)`);
+        }
+        await zsession.close();
+        return;
+      }
+      // `sz` on the server: it sends us files.
+      zsession.on("offer", (xfer: any) => {
+        void (async () => {
+          const details = xfer.get_details();
+          const item: ZmodemTransferItem = {
+            id: ++transferSeq,
+            name: String(details.name ?? "file"),
+            size: Number(details.size ?? 0),
+            bytes: 0,
+            status: "active",
+          };
+          offers.set(item.id, xfer);
+          upsert(item);
+          const handle =
+            typeof plugin.fileTransfer?.beginSave === "function"
+              ? await plugin.fileTransfer.beginSave({ name: item.name, size: item.size })
+              : null;
+          if (!handle) {
+            offers.delete(item.id);
+            upsert({ ...item, status: "canceled" });
+            diag(`receive: skipped ${item.name} (no save handle)`);
+            xfer.skip();
+            return;
+          }
+          // writes must stay ordered even though input events fire in a tight
+          // synchronous loop while the peer streams
+          let writeChain = Promise.resolve();
+          let received = 0;
+          let canceled = false;
+          xfer.on("input", (octets: number[] | Uint8Array) => {
+            const data = toUint8(octets);
+            const offset = received;
+            received += data.length;
+            upsert({ ...item, bytes: received });
+            writeChain = writeChain.then(async () => {
+              try {
+                await plugin.fileTransfer!.write(
+                  handle.handleId,
+                  offset,
+                  plugin.encodeBase64 ? plugin.encodeBase64(data) : (data as unknown),
+                );
+              } catch {
+                /* the host surface is gone — the transfer will fail on its own */
+              }
+            });
+          });
+          // a skip() requested from the progress window flips this via the
+          // offers map; accept() then resolves early
+          canceled = items.find((entry) => entry.id === item.id)?.status === "canceled";
+          try {
+            await xfer.accept();
+          } catch {
+            canceled = true;
+          }
+          await writeChain;
+          await plugin.fileTransfer!.finish(handle.handleId).catch(() => undefined);
+          offers.delete(item.id);
+          const finalStatus = canceled || items.find((entry) => entry.id === item.id)?.status === "canceled" ? "canceled" : "done";
+          upsert({ ...item, status: finalStatus, bytes: received });
+          diag(`receive: ${item.name} ${finalStatus} (${received} bytes)`);
+        })();
+      });
+      zsession.on("session_end", () => diag("receive: session ended"));
+      await zsession.start();
+    } catch (error: any) {
+      hooks.notify(`ZMODEM 传输失败: ${error?.message || error}`, "error");
+      diag("session failed: " + String(error?.message ?? error));
+      armCooldown();
+      try {
+        zsession.abort();
+      } catch {
+        /* already gone */
+      }
+    }
+  }
 
   return {
     consume(data: Uint8Array) {
@@ -157,102 +320,35 @@ export function createZmodemSentry(hooks: ZmodemHooks): {
         /* already gone */
       }
     },
-  };
-}
-
-async function runSession(
-  zsession: any,
-  hooks: ZmodemHooks,
-  plugin: ReturnType<typeof bridge>,
-  diag: (line: string) => void,
-  armCooldown: () => void,
-): Promise<void> {
-  try {
-    if (zsession.type === "send") {
-      // `rz` on the server: it waits for us to send files.
-      const files = await pickZmodemFiles();
-      if (!files || files.length === 0) {
-        hooks.notify("rz: 未选择文件，传输取消", "info");
-        diag("send: no files picked, aborting");
-        armCooldown();
-        zsession.abort();
+    cancel(id: number) {
+      const item = items.find((entry) => entry.id === id);
+      if (!item || item.status !== "active") return;
+      diag(`cancel requested for ${item.name}`);
+      if (session?.type === "receive") {
+        // in-protocol skip: the server drops this file and offers the next
+        upsert({ ...item, status: "canceled" });
+        try {
+          offers.get(id)?.skip();
+        } catch {
+          /* offer already gone */
+        }
         return;
       }
-      for (const handle of files) {
-        const size = handleFileSize(handle) ?? 0;
-        const name = handleFileName(handle);
-        const xfer = await zsession.send_offer({
-          name,
-          size,
-          mode: 0o644,
-          mtime: Math.floor(Date.now() / 1000),
-        });
-        if (!xfer) continue; // peer skipped
-        let offset = 0;
-        while (offset < size) {
-          const chunk = await readHandleChunk(handle, offset, Math.min(READ_CHUNK, size - offset));
-          if (chunk.length === 0) break;
-          xfer.send(chunk);
-          offset += chunk.length;
-        }
-        await xfer.end();
-        diag(`send: ${name} complete (${size} bytes)`);
-        hooks.notify(`rz: ${name} 已上传`, "info");
+      // send: stop the read loop, mark everything in flight canceled, abort
+      sendAbortRequested = true;
+      for (const entry of items) {
+        if (entry.status === "active") upsert({ ...entry, status: "canceled" });
       }
-      await zsession.close();
-      return;
-    }
-    // `sz` on the server: it sends us files.
-    zsession.on("offer", (xfer: any) => {
-      void (async () => {
-        const details = xfer.get_details();
-        const handle =
-          typeof plugin.fileTransfer?.beginSave === "function"
-            ? await plugin.fileTransfer.beginSave({ name: details.name, size: details.size })
-            : null;
-        if (!handle) {
-          diag(`receive: skipped ${details.name} (no save handle)`);
-          xfer.skip();
-          hooks.notify(`sz: 已跳过 ${details.name}`, "info");
-          return;
-        }
-        // writes must stay ordered even though input events fire in a tight
-        // synchronous loop while the peer streams
-        let writeChain = Promise.resolve();
-        let received = 0;
-        xfer.on("input", (octets: number[] | Uint8Array) => {
-          const data = toUint8(octets);
-          const offset = received;
-          received += data.length;
-          writeChain = writeChain.then(async () => {
-            try {
-              await plugin.fileTransfer!.write(
-                handle.handleId,
-                offset,
-                plugin.encodeBase64 ? plugin.encodeBase64(data) : (data as unknown),
-              );
-            } catch {
-              /* the host surface is gone — the transfer will fail on its own */
-            }
-          });
-        });
-        await xfer.accept();
-        await writeChain;
-        await plugin.fileTransfer!.finish(handle.handleId).catch(() => undefined);
-        diag(`receive: ${details.name} complete (${received} bytes)`);
-        hooks.notify(`sz: ${details.name} 已保存`, "info");
-      })();
-    });
-    zsession.on("session_end", () => diag("receive: session ended"));
-    await zsession.start();
-  } catch (error: any) {
-    hooks.notify(`ZMODEM 传输失败: ${error?.message || error}`, "error");
-    diag("session failed: " + String(error?.message ?? error));
-    armCooldown();
-    try {
-      zsession.abort();
-    } catch {
-      /* already gone */
-    }
-  }
+      try {
+        session?.abort();
+      } catch {
+        /* already gone */
+      }
+      armCooldown();
+    },
+    dismiss(id: number) {
+      items = items.filter((entry) => entry.id !== id);
+      emit();
+    },
+  };
 }

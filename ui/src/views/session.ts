@@ -10,7 +10,7 @@ import { notify } from "../notify";
 import { createTerminal, type TerminalHandle } from "../term";
 import { createFilePanel, type FilePanel } from "../filepanel";
 import { Highlighter } from "../highlight";
-import { createZmodemSentry } from "../zmodem";
+import { createZmodemSentry, type ZmodemSentryHandle, type ZmodemTransferItem } from "../zmodem";
 import {
   defaultStyleSettings,
   loadStyleSettings,
@@ -68,7 +68,7 @@ interface ShellTab {
   highlighter?: Highlighter;
   offBinary?: () => void;
   // rz/sz stream fork: sees the tab's output before the highlighter
-  zmodemSentry?: { consume(data: Uint8Array): void; dispose(): void };
+  zmodemSentry?: ZmodemSentryHandle;
   attached?: boolean;
   filePanel?: FilePanel;
   // last cwd the shell reported via OSC 7 (fed to the panel when it opens)
@@ -122,6 +122,7 @@ export async function mountSession(context: SessionContext): Promise<() => void>
     <div class="server-pop" id="server-pop" hidden></div>
     <div class="server-pop snips-pop" id="snips-pop" hidden></div>
     <div class="server-pop monitor-pop" id="monitor-pop" hidden></div>
+    <div class="zm-transfers" id="zm-transfers" hidden></div>
     <div class="ctx-menu" id="tab-menu" hidden></div>
     <div class="overlay" id="overlay" hidden>
       <div class="overlay-card">
@@ -208,6 +209,92 @@ export async function mountSession(context: SessionContext): Promise<() => void>
 
   const encoder = new TextEncoder();
   const attachFailed = new Set<string>();
+
+  // ---- ZMODEM transfer window (Xshell-style progress card) ----
+  // One card for the whole view: every tab's rz/sz transfers merge into it,
+  // each row showing name / progress / rate / cancel.
+  const zmBox = root.querySelector<HTMLElement>("#zm-transfers")!;
+  const zmItemsByTab = new Map<ShellTab, ZmodemTransferItem[]>();
+  const zmStartedAt = new Map<number, number>();
+  const zmAutoClosed = new Set<number>();
+
+  function humanBytes(count: number): string {
+    if (count >= 1024 * 1024 * 1024) return `${(count / 1024 / 1024 / 1024).toFixed(2)} GB`;
+    if (count >= 1024 * 1024) return `${(count / 1024 / 1024).toFixed(1)} MB`;
+    if (count >= 1024) return `${(count / 1024).toFixed(0)} KB`;
+    return `${count} B`;
+  }
+  function zmRate(item: ZmodemTransferItem): string {
+    const started = zmStartedAt.get(item.id);
+    if (!started || item.bytes <= 0) return "";
+    const seconds = Math.max(0.001, (Date.now() - started) / 1000);
+    const bps = item.bytes / seconds;
+    if (bps >= 1024 * 1024) return `${(bps / 1024 / 1024).toFixed(1)} MB/s`;
+    if (bps >= 1024) return `${(bps / 1024).toFixed(0)} KB/s`;
+    return `${bps.toFixed(0)} B/s`;
+  }
+  function onZmTransfers(tab: ShellTab, items: ZmodemTransferItem[]): void {
+    for (const item of items) {
+      if (!zmStartedAt.has(item.id)) zmStartedAt.set(item.id, Date.now());
+    }
+    if (items.length === 0) zmItemsByTab.delete(tab);
+    else zmItemsByTab.set(tab, items);
+    renderZmTransfers();
+  }
+  function renderZmTransfers(): void {
+    zmBox.innerHTML = "";
+    const rows: { tab: ShellTab; item: ZmodemTransferItem }[] = [];
+    for (const [tab, items] of zmItemsByTab) {
+      for (const item of items) rows.push({ tab, item });
+    }
+    if (rows.length === 0) {
+      zmBox.hidden = true;
+      return;
+    }
+    zmBox.hidden = false;
+    const head = document.createElement("div");
+    head.className = "zm-head";
+    head.textContent = t("zmTitle");
+    zmBox.append(head);
+    for (const { tab, item } of rows) {
+      const row = document.createElement("div");
+      row.className = "zm-row" + (item.status !== "active" ? " zm-finished" : "");
+      row.innerHTML = `
+        <div class="zm-line">
+          <span class="zm-name"></span>
+          <span class="zm-meta"></span>
+          <button class="zm-cancel" title="${t("cancel")}">×</button>
+        </div>
+        <div class="zm-bar"><span></span></div>`;
+      row.querySelector<HTMLElement>(".zm-name")!.textContent = item.name;
+      const meta = row.querySelector<HTMLElement>(".zm-meta")!;
+      if (item.status === "active") {
+        meta.textContent = `${humanBytes(item.bytes)} / ${humanBytes(item.size)} · ${zmRate(item)}`;
+      } else {
+        meta.textContent =
+          item.status === "done" ? t("done") : item.status === "canceled" ? t("canceled") : t("failed");
+      }
+      const pct = item.size > 0 ? Math.min(100, (item.bytes / item.size) * 100) : 0;
+      const fill = row.querySelector<HTMLElement>(".zm-bar span")!;
+      fill.style.width = `${pct}%`;
+      if (item.status === "done") fill.classList.add("zm-ok");
+      row.querySelector<HTMLElement>(".zm-cancel")!.addEventListener("click", () => {
+        if (item.status === "active") tab.zmodemSentry?.cancel(item.id);
+        else tab.zmodemSentry?.dismiss(item.id);
+      });
+      zmBox.append(row);
+      // finished items auto-close per the transfer setting (failed/canceled
+      // rows stay for inspection, matching the file-panel queue)
+      if (item.status === "done" && styleState.transferAutoClose && !zmAutoClosed.has(item.id)) {
+        zmAutoClosed.add(item.id);
+        window.setTimeout(
+          () => tab.zmodemSentry?.dismiss(item.id),
+          Math.max(0, styleState.transferAutoCloseDelay * 1000),
+        );
+      }
+    }
+  }
+
 
   // ---- broadcast input (sync typing across the current group's panes) ----
   let broadcast = false;
@@ -485,6 +572,7 @@ export async function mountSession(context: SessionContext): Promise<() => void>
       diag: (line) => {
         void api("diag/log", { line: `zmodem: ${line}` }, 5000).catch(() => undefined);
       },
+      onTransfers: (items) => onZmTransfers(tab, items),
     });
     tab.offBinary = onBinaryChannel(`term/${tab.shellId}`, (data) => {
       tab.zmodemSentry!.consume(data);
@@ -585,6 +673,7 @@ export async function mountSession(context: SessionContext): Promise<() => void>
         diag: (line) => {
           void api("diag/log", { line: `zmodem: ${line}` }, 5000).catch(() => undefined);
         },
+        onTransfers: (items) => onZmTransfers(tab, items),
       });
       tab.offBinary = onBinaryChannel(`term/${shellId}`, (data) => tab.zmodemSentry!.consume(data));
     }
