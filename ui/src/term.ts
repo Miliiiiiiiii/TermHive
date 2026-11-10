@@ -10,9 +10,16 @@ import { findScheme } from "./theme";
 import "@xterm/xterm/css/xterm.css";
 
 export function isLightTheme(): boolean {
-  const appearance = document.documentElement.dataset.dbxTheme;
+  // the real host reports its appearance through the bridge; data-dbxTheme
+  // only exists under the mock dev host, and prefers-color-scheme follows
+  // the OS, not the DBX app theme (a light DBX theme on a dark-OS machine
+  // was misdetected as dark)
+  const appearance = window.dbxPlugin?.theme?.appearance;
   if (appearance === "light") return true;
   if (appearance === "dark") return false;
+  const data = document.documentElement.dataset.dbxTheme;
+  if (data === "light") return true;
+  if (data === "dark") return false;
   return window.matchMedia?.("(prefers-color-scheme: light)").matches ?? false;
 }
 
@@ -140,17 +147,18 @@ function buildSearchBar(container: HTMLElement, search: SearchAddon, onClose: ()
   return bar;
 }
 
-// Selection colors are injected into every theme: without them xterm paints
-// a highlight that is nearly invisible on light backgrounds, which made
-// selections in the log viewer (and terminals) look unselectable. A
-// translucent fill keeps ANSI-colored log text readable underneath;
-// selectionForeground stays unset on purpose — overriding it would flatten
-// the log colors inside the selection.
+// Selection colors are injected into every theme: xterm's built-in fallback
+// is a near-invisible white glaze (rgba(255,255,255,.3)) on light
+// backgrounds. Both focus states deliberately share ONE color: the DBX
+// webview's focus model can leave the terminal permanently "inactive", and
+// a faded selection there looks exactly like the missing-selection bug this
+// fixes. #rrggbbaa hits xterm's direct-parse branch (length 9), skipping
+// the rgba() regex entirely. selectionForeground stays unset so colored
+// log text keeps its ANSI colors inside the selection.
 function withSelectionColors(theme: ITheme, light: boolean): ITheme {
   return {
     ...theme,
-    selectionBackground: light ? "rgba(37, 99, 235, 0.40)" : "rgba(96, 165, 250, 0.45)",
-    selectionInactiveBackground: light ? "rgba(37, 99, 235, 0.18)" : "rgba(96, 165, 250, 0.25)",
+    selectionBackground: light ? "#2563eb66" : "#60a5fa73",
   };
 }
 
