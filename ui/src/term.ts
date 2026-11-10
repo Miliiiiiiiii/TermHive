@@ -140,23 +140,40 @@ function buildSearchBar(container: HTMLElement, search: SearchAddon, onClose: ()
   return bar;
 }
 
+// Selection colors are injected into every theme: without them xterm paints
+// a highlight that is nearly invisible on light backgrounds, which made
+// selections in the log viewer (and terminals) look unselectable. A
+// translucent fill keeps ANSI-colored log text readable underneath;
+// selectionForeground stays unset on purpose — overriding it would flatten
+// the log colors inside the selection.
+function withSelectionColors(theme: ITheme, light: boolean): ITheme {
+  return {
+    ...theme,
+    selectionBackground: light ? "rgba(37, 99, 235, 0.40)" : "rgba(96, 165, 250, 0.45)",
+    selectionInactiveBackground: light ? "rgba(37, 99, 235, 0.18)" : "rgba(96, 165, 250, 0.25)",
+  };
+}
+
 // themeFor resolves a scheme id into an xterm theme; "auto" (or an unknown
 // id) follows the DBX host tokens.
 export function themeFor(schemeId: string): ITheme {
   const scheme = findScheme(schemeId);
-  if (scheme) return scheme.theme;
+  if (scheme) return withSelectionColors(scheme.theme, scheme.light === true);
   const light = isLightTheme();
-  return light
-    ? {
-        background: tokenColor("--color-background", "#ffffff"),
-        foreground: tokenColor("--color-foreground", "#27272a"),
-        cursor: tokenColor("--color-primary", "#2563eb"),
-      }
-    : {
-        background: tokenColor("--color-background", "#18181b"),
-        foreground: tokenColor("--color-foreground", "#f4f4f5"),
-        cursor: tokenColor("--color-primary", "#60a5fa"),
-      };
+  return withSelectionColors(
+    light
+      ? {
+          background: tokenColor("--color-background", "#ffffff"),
+          foreground: tokenColor("--color-foreground", "#27272a"),
+          cursor: tokenColor("--color-primary", "#2563eb"),
+        }
+      : {
+          background: tokenColor("--color-background", "#18181b"),
+          foreground: tokenColor("--color-foreground", "#f4f4f5"),
+          cursor: tokenColor("--color-primary", "#60a5fa"),
+        },
+    light,
+  );
 }
 
 export function createTerminal(
