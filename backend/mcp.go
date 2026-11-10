@@ -140,13 +140,12 @@ func mcpTextResult(text string, isErr bool) map[string]any {
 // binds each call to one connection: it injects the record id as
 // connectionId and attaches the full record as lifecycle — the payload
 // connection/connect gets. That spec is the authority on which server the
-// id means and is dialed from directly: the MCP bridge runs its own sidecar
-// of this plugin, whose spec cache can predate the connection, and a cache
-// lookup that guessed (findSpec's single-spec fallback) would run the
-// command on whichever server this sidecar happened to know. Without a
-// lifecycle (older hosts) the id must match the cache exactly. Either way
-// the shared client is redialed when it dropped — the same recovery a
-// workbench tab gets after a sidecar restart.
+// id means and is dialed from directly (and cached on success, so the
+// auto-reconnect supervisor can redial after a drop). Without a lifecycle
+// (older hosts) the id must match the cache exactly — no guessing, a
+// wrong-server answer is worse than an error. Either way the shared client
+// is redialed when it dropped — the same recovery a workbench tab gets
+// after a sidecar restart.
 func (manager *Manager) mcpConnection(arguments, lifecycle map[string]any, emitter *dbxpluginsdk.Emitter) (*Conn, error) {
 	known, haveKnown := manager.lifecycleSpec(lifecycle)
 	var candidates []string

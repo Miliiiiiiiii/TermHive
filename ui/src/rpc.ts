@@ -60,8 +60,25 @@ export async function api<T = any>(method: string, params?: unknown, timeoutMs?:
   try {
     return (await bridge().invoke(method, params ?? {}, timeoutMs ? { timeoutMs } : undefined)) as T;
   } catch (error: any) {
-    throw new Error(error?.message || String(error));
+    // Keep the RPC error code alongside the message: the session overlay
+    // switches to its dead-end mode on errCodeNoConnSpec, and hosts that
+    // reject with a plain Error fall back to message matching.
+    const wrapped = new Error(error?.message || String(error));
+    (wrapped as any).code = error?.code;
+    throw wrapped;
   }
+}
+
+// errCodeNoConnSpec mirrors backend errCodeNoConnSpec: the sidecar has no
+// dial recipe for the connection (disconnected, or never connected there) —
+// no retry can succeed, only the sidebar double-click can.
+export const errCodeNoConnSpec = -32005;
+
+export function isNoConnSpecError(error: any): boolean {
+  return (
+    Number((error as any)?.code) === errCodeNoConnSpec ||
+    /连接尚未建立/.test(String(error?.message || ""))
+  );
 }
 
 export function notify(method: string, params?: unknown): void {

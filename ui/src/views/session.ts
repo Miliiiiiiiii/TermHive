@@ -21,6 +21,7 @@ import {
 import {
   api,
   ensureConnection,
+  isNoConnSpecError,
   MINI_ID,
   newShellForConnection,
   onBinaryChannel,
@@ -142,6 +143,7 @@ export async function mountSession(context: SessionContext): Promise<() => void>
   const overlay = root.querySelector<HTMLElement>("#overlay")!;
   const overlayTitle = root.querySelector<HTMLElement>("#overlay-title")!;
   const overlayReason = root.querySelector<HTMLElement>("#overlay-reason")!;
+  const reconnectButton = root.querySelector<HTMLElement>("#btn-reconnect")!;
   const panesBox = root.querySelector<HTMLElement>("#panes")!;
   const termWrap = root.querySelector<HTMLElement>("#term")!;
   const filesWrap = root.querySelector<HTMLElement>("#files")!;
@@ -485,6 +487,18 @@ export async function mountSession(context: SessionContext): Promise<() => void>
       refreshConnDots();
       return;
     }
+    if (message.method === "connection.disconnected") {
+      // The connection was disconnected on purpose (sidebar / host). No
+      // supervisor will run and ensure() can never bring the recipe back —
+      // this tab goes straight to the dead-end overlay. The shell.close
+      // events of the teardown arrive first and show the reconnecting
+      // wording; this replaces it.
+      connStates.set(String(message.params.connectionId || ""), "failed");
+      refreshConnDots();
+      if (String(message.params.connectionId || "") !== connectionId) return;
+      showDeadEnd();
+      return;
+    }
     if (message.method === "connection.reconnecting") {
       connStates.set(String(message.params.connectionId || ""), "reconnecting");
       refreshConnDots();
@@ -507,9 +521,15 @@ export async function mountSession(context: SessionContext): Promise<() => void>
       connStates.set(String(message.params.connectionId || ""), "failed");
       refreshConnDots();
       if (String(message.params.connectionId || "") !== connectionId || !closedNotified) return;
+      if (message.params.deadEnd === true) {
+        // Structural failure (no dial recipe left): retries cannot succeed.
+        showDeadEnd();
+        return;
+      }
       statusDot.className = "dot dead";
       overlayTitle.textContent = t("disconnected");
       overlayReason.textContent = `${t("reconnectFailed")}: ${String(message.params.reason || "")}`;
+      reconnectButton.hidden = false;
       overlay.hidden = false;
       return;
     }
@@ -1260,6 +1280,26 @@ export async function mountSession(context: SessionContext): Promise<() => void>
       overlayTitle.textContent = t("disconnected");
       overlayReason.textContent = reason;
     }
+    reconnectButton.hidden = false;
+    overlay.hidden = false;
+  }
+
+  // showDeadEnd is the overlay mode for failures no retry can fix: the
+  // sidecar no longer has the connection's dial recipe (the connection was
+  // disconnected in the sidebar, or this sidecar never saw a full connect).
+  // ensure() fails instantly and identically every time, so the 重新连接
+  // button stands down and the guidance becomes the whole message — the
+  // sidebar double-click is the only move that carries fresh credentials.
+  // The view stays revive-eligible: a later connection/connect announces
+  // connection.reconnected, which reruns connect() and rebinds this tab.
+  // Deliberately not guarded by closedNotified — it must be able to REPLACE
+  // the reconnecting/dead text shown before the dead end was discovered.
+  function showDeadEnd(): void {
+    closedNotified = true;
+    statusDot.className = "dot dead";
+    overlayTitle.textContent = t("disconnected");
+    overlayReason.textContent = t("connNeedsReopen");
+    reconnectButton.hidden = true;
     overlay.hidden = false;
   }
 
@@ -1267,6 +1307,7 @@ export async function mountSession(context: SessionContext): Promise<() => void>
     closedNotified = false;
     statusDot.className = "dot busy";
     overlay.hidden = true;
+    reconnectButton.hidden = false;
     if (!connectionId) {
       showClosed("tab context has no connectionId");
       return;
@@ -1293,6 +1334,10 @@ export async function mountSession(context: SessionContext): Promise<() => void>
       tabs.push({ shellId: next.shellId, title: nextTitle(), connectionId, fresh: true });
       focusTab(tabs.length - 1);
     } catch (error: any) {
+      if (isNoConnSpecError(error)) {
+        showDeadEnd();
+        return;
+      }
       showClosed(error.message);
     }
   }

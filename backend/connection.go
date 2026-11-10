@@ -194,7 +194,11 @@ func sameEndpoint(a, b ConnSpec) bool {
 
 // ConnectConnection handles connection/connect. The host may call it again
 // after a sidecar restart, so it is idempotent per connection id: the shared
-// client is established once and the primary PTY opened over it.
+// client is established once and the primary PTY opened over it. The spec is
+// cached (memory + disk) inside conn() on the successful dial. A fresh dial
+// also announces connection.reconnected: a tab stranded on the dead-end
+// overlay (its connection was disconnected) heals itself when the user
+// double-clicks the connection in the sidebar again.
 func (manager *Manager) ConnectConnection(request LifecycleRequest, emitter *dbxpluginsdk.Emitter) (map[string]any, *dbxpluginsdk.PluginError) {
 	spec, err := request.spec()
 	if err != nil {
@@ -207,10 +211,9 @@ func (manager *Manager) ConnectConnection(request LifecycleRequest, emitter *dbx
 	if dialErr != nil {
 		return nil, dbxpluginsdk.NewError(-32002, dialErr.Error())
 	}
-	manager.mutex.Lock()
-	manager.specs[spec.ConnectionID] = spec
-	manager.mutex.Unlock()
-	manager.upsertSpecsToDisk(map[string]ConnSpec{spec.ConnectionID: spec})
+	manager.emit("connection.reconnected", map[string]any{
+		"connectionId": spec.ConnectionID, "attempts": 0,
+	})
 	shellID, dialErr := manager.dial(conn, 80, 24, emitter)
 	if dialErr != nil {
 		return nil, dbxpluginsdk.NewError(-32002, dialErr.Error())
@@ -245,26 +248,21 @@ func (manager *Manager) DisconnectConnection(request LifecycleRequest) {
 	if conn != nil {
 		conn.Close()
 	}
+	// Tell still-open tabs the connection is gone on purpose: their overlay
+	// must switch to the dead-end mode (sidebar double-click guidance) rather
+	// than the "auto-reconnecting" one — no supervisor will ever fire, and
+	// ensure() can no longer bring the recipe back.
+	manager.emit("connection.disconnected", map[string]any{"connectionId": connectionID})
 }
 
-// findSpec resolves the dial recipe for a connection id. The host can issue
-// a fresh record id for the same saved connection (recreate, re-import),
-// which would strand already-open tabs. An exact miss falls back to the only
-// cached spec when there is exactly one — with multiple servers cached the
-// id is required, since the request carries nothing else to match on.
-func (manager *Manager) findSpec(connectionID string) (ConnSpec, bool) {
-	manager.mutex.Lock()
-	defer manager.mutex.Unlock()
-	if spec, ok := manager.specs[connectionID]; ok {
-		return spec, true
-	}
-	if len(manager.specs) == 1 {
-		for _, spec := range manager.specs {
-			return spec, true
-		}
-	}
-	return ConnSpec{}, false
-}
+// findSpec used to fall back to the only cached spec on an exact miss —
+// "the host reissued the record id" — but that guess silently redialed
+// whichever one server this sidecar happened to know and ran the caller's
+// terminal on the wrong host (an id-only ensure with two connections cached
+// merely failed; with exactly one it would have connected to the wrong
+// server). Recipe resolution is exact-by-id everywhere now; a stranded tab
+// lands in the overlay's dead-end mode, which points at the sidebar
+// double-click — the only move that carries fresh credentials.
 
 // cachedSpec is the spec cached for exactly this id, refreshing from disk
 // on a miss: the workbench's sidecar may have connected the id after this
@@ -283,17 +281,26 @@ func (manager *Manager) cachedSpec(connectionID string) (ConnSpec, bool) {
 	return spec, ok
 }
 
-// connExact is conn for callers that hold nothing but an id: it must be
-// cached exactly. findSpec's single-spec fallback is deliberately skipped —
-// it serves the workbench reconnect path (host reissued the record id) and
-// would otherwise answer with whichever one server this sidecar knows,
-// running the caller's command on the wrong host.
+// errNoConnSpec is the dead-end failure for id-only callers: this sidecar has
+// no dial recipe for the connection (never connected here, or the connection
+// was disconnected, which drops the recipe from memory and disk). No amount
+// of retrying can fix it — only a fresh connection/connect from the host
+// (sidebar double-click) supplies the recipe again — so the reconnect
+// supervisor treats it as permanent and the UI's 重新连接 button stands down
+// instead of looping. Callers translate it to errCodeNoConnSpec for the UI.
+var errNoConnSpec = errors.New("连接尚未建立: 请在左侧连接列表断开后重新双击该连接")
+
+// errCodeNoConnSpec is the RPC error code the workbench maps errNoConnSpec
+// to, so the overlay can switch to its dead-end mode without string-matching.
+const errCodeNoConnSpec = -32005
+
+// connExact is conn for callers that hold nothing but an id: the recipe must
+// be cached for exactly that id. conn() itself resolves id-only calls the
+// same exact way — guessed fallbacks were removed: answering with whichever
+// one server this sidecar happened to know would run the caller's terminal
+// on the wrong host. The wrapper stays as the explicit marker at call sites.
 func (manager *Manager) connExact(connectionID string, emitter *dbxpluginsdk.Emitter) (*Conn, error) {
-	spec, ok := manager.cachedSpec(connectionID)
-	if !ok {
-		return nil, errors.New("连接尚未建立: 请在左侧连接列表断开后重新双击该连接")
-	}
-	return manager.conn(connectionID, emitter, spec)
+	return manager.conn(connectionID, emitter)
 }
 
 // EnsureConnection is the workbench entry point: it returns a live PTY of
@@ -305,6 +312,13 @@ func (manager *Manager) EnsureConnection(connectionID string, emitter *dbxplugin
 	}
 	conn, err := manager.conn(connectionID, emitter)
 	if err != nil {
+		if errors.Is(err, errNoConnSpec) {
+			// Dead end for the 重新连接 button: this sidecar has no recipe
+			// for the id (disconnected, or never connected here). A distinct
+			// code lets the overlay stand down instead of looping the user
+			// through a failure that cannot succeed.
+			return nil, dbxpluginsdk.NewError(errCodeNoConnSpec, err.Error())
+		}
 		return nil, dbxpluginsdk.NewError(-32001, err.Error())
 	}
 	shellID, dialErr := manager.dial(conn, 80, 24, emitter)
@@ -317,10 +331,9 @@ func (manager *Manager) EnsureConnection(connectionID string, emitter *dbxplugin
 // Credentials returns the plaintext auth material the sidecar received at
 // connect time, so the UI can offer "复制密码".
 func (manager *Manager) Credentials(connectionID string) (map[string]any, *dbxpluginsdk.PluginError) {
-	spec, ok := manager.findSpec(connectionID)
+	spec, ok := manager.cachedSpec(connectionID)
 	if !ok {
-		return nil, dbxpluginsdk.NewError(-32001,
-			"连接尚未建立: 请在左侧连接列表断开后重新双击该连接")
+		return nil, dbxpluginsdk.NewError(errCodeNoConnSpec, errNoConnSpec.Error())
 	}
 	return map[string]any{
 		"connectionId": spec.ConnectionID,
@@ -359,10 +372,16 @@ type dialFlight struct {
 // conn returns the live shared SSH connection for an id, dialing it (again)
 // when the host has no live client — e.g. after a sidecar restart. The spec
 // to dial with is supplied by the caller when known (lifecycle payloads carry
-// it), falling back to the cached spec otherwise. Concurrent calls for the
-// same id share one dial (dialFlights); a caller whose known spec points at a
-// different endpoint than the in-flight dial waits one round and dials its
-// own endpoint (cross-wired cache replacement, at most one extra round).
+// it); id-only calls resolve the recipe from the cache, exactly by id and
+// refreshed from disk on a miss (the other sidecar may have flushed it). A
+// recipe supplied by the caller and proven dialable is cached in memory and
+// flushed to disk — ConnectConnection used to be the only writer, which
+// stranded MCP-bridged connections: their auto-reconnect supervisor had no
+// recipe to redial with and spun on 连接尚未建立 until the attempt cap.
+// Concurrent calls for the same id share one dial (dialFlights); a caller
+// whose known spec points at a different endpoint than the in-flight dial
+// waits one round and dials its own endpoint (cross-wired cache replacement,
+// at most one extra round).
 func (manager *Manager) conn(connectionID string, emitter *dbxpluginsdk.Emitter, known ...ConnSpec) (*Conn, error) {
 	for round := 0; ; round++ {
 		manager.mutex.Lock()
@@ -383,10 +402,10 @@ func (manager *Manager) conn(connectionID string, emitter *dbxpluginsdk.Emitter,
 		if len(known) > 0 {
 			spec, ok = known[0], true
 		} else {
-			spec, ok = manager.findSpec(connectionID)
+			spec, ok = manager.cachedSpec(connectionID)
 		}
 		if !ok {
-			return nil, errors.New("连接尚未建立: 请在左侧连接列表断开后重新双击该连接")
+			return nil, errNoConnSpec
 		}
 
 		manager.mutex.Lock()
@@ -409,12 +428,23 @@ func (manager *Manager) conn(connectionID string, emitter *dbxpluginsdk.Emitter,
 			manager.mutex.Lock()
 			old := manager.conns[connectionID]
 			manager.conns[connectionID] = conn
+			callerSupplied := len(known) > 0
+			if callerSupplied {
+				// Proven-dialable recipe from the caller: make it this
+				// sidecar's authority for the id so id-only recovery paths
+				// (ensure, the reconnect supervisor, the other sidecar via
+				// the shared disk cache) can redial after the link drops.
+				manager.specs[spec.ConnectionID] = spec
+			}
 			delete(manager.dialFlights, connectionID)
 			flight.err = nil
 			close(flight.done)
 			manager.mutex.Unlock()
 			if old != nil {
 				old.Close()
+			}
+			if callerSupplied {
+				manager.upsertSpecsToDisk(map[string]ConnSpec{spec.ConnectionID: spec})
 			}
 			return conn, nil
 		}

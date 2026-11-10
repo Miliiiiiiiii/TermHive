@@ -18,6 +18,7 @@ package main
 // MITM alarm.
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -94,13 +95,16 @@ func connProbeAlive(conn *Conn) bool {
 	return err == nil
 }
 
-// isPermanentConnectFailure: retrying cannot fix wrong credentials, and
-// auto-retrying a host-key change would normalize dismissing the MITM alarm.
+// isPermanentConnectFailure: retrying cannot fix wrong credentials, a
+// missing dial recipe (the connection was disconnected mid-flight — only a
+// fresh connection/connect can supply one), and auto-retrying a host-key
+// change would normalize dismissing the MITM alarm.
 func isPermanentConnectFailure(err error) bool {
 	if err == nil {
 		return false
 	}
 	return isAuthFailure(err) ||
+		errors.Is(err, errNoConnSpec) ||
 		strings.Contains(err.Error(), "主机密钥已变更") ||
 		strings.Contains(err.Error(), "安全警报")
 }
@@ -194,10 +198,18 @@ func (manager *Manager) superviseReconnect(connectionID string, cancel chan stru
 			return
 		}
 		conn.markDead()
-		if _, err := manager.conn(connectionID, manager.currentEmitter()); err != nil {
+		// Redial with the dead connection's own recipe: it is exact by
+		// construction, so a cache miss (the id was never cached anywhere —
+		// the pre-0.1.0-rc.21 MCP-bridge case) cannot strand the loop.
+		if _, err := manager.conn(connectionID, manager.currentEmitter(), conn.Spec); err != nil {
 			if isPermanentConnectFailure(err) {
 				manager.emit("connection.failed", map[string]any{
-					"connectionId": connectionID, "reason": err.Error(),
+					"connectionId": connectionID,
+					"reason":       err.Error(),
+					// deadEnd marks failures no retry can fix structurally
+					// (no recipe left): the overlay stops offering 重连 and
+					// points at the sidebar double-click instead.
+					"deadEnd": errors.Is(err, errNoConnSpec),
 				})
 				manager.finishSupervision(connectionID)
 				return
