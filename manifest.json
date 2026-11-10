@@ -3,7 +3,7 @@
   "manifest_version": 1,
   "id": "com.milii.termhive",
   "name": "TermHive",
-  "version": "0.1.0-rc.20",
+  "version": "0.1.0-rc.21",
   "publisher": "milii",
   "description": "SSH terminal + SFTP file manager as native DBX connections. Open a saved connection to get a terminal and file transfers in a DBX tab.",
   "icon": "assets/plugin.svg",
