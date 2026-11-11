@@ -7,6 +7,10 @@ import { SearchAddon } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { findScheme } from "./theme";
+import { copyToClipboard, readClipboard } from "./host";
+import { showContextMenu, type MenuItem } from "./menu";
+import { t } from "./i18n";
+import { notify } from "./notify";
 import "@xterm/xterm/css/xterm.css";
 
 export function isLightTheme(): boolean {
@@ -31,6 +35,18 @@ export interface TerminalOptions {
   // font/scrollback preferences from the plugin settings (defaults apply
   // when absent — the mini window and log viewer ride the same settings)
   style?: TerminalStyle;
+  // Log-viewer mode: the terminal is a read-only log surface with no pty
+  // behind it, so Ctrl+C/Cmd+C and Ctrl+A are free to mean copy and
+  // select-all; double-click word boundaries gain log separators, and the
+  // stock terminal context menu (which offers paste) is skipped in favor
+  // of the viewer's own menu.
+  logMode?: boolean;
+  // Copy feedback for the built-in copy shortcut; defaults to a toast.
+  onCopied?: (chars: number) => void;
+  // First-look key filter (log viewer's Shift+Arrow selection): returning
+  // false swallows the key before xterm's own handling. The one registered
+  // custom key handler is shared, so views hook in through this.
+  onKeyDown?: (event: KeyboardEvent) => boolean | undefined;
 }
 
 export interface TerminalStyle {
@@ -53,7 +69,7 @@ export interface TerminalHandle {
   dispose: () => void;
   cols: () => number;
   rows: () => number;
-  openSearch: () => void;
+  openSearch: (preset?: string) => void;
   setScheme: (schemeId: string) => void;
   applyStyle: (style: TerminalStyle) => void;
 }
@@ -201,6 +217,11 @@ export function createTerminal(
     allowProposedApi: true,
     scrollback: style.scrollback,
     theme: themeFor(schemeId),
+    // log mode: break double-click words on log separators too (timestamps,
+    // key=value, syslog pipes) and select the word under a right-click
+    ...(options.logMode
+      ? { wordSeparator: ' ()[]{}\',"|:=', rightClickSelectsWord: true as const }
+      : {}),
   });
   const fitAddon = new FitAddon();
   terminal.loadAddon(fitAddon);
@@ -228,20 +249,87 @@ export function createTerminal(
     container.style.position = "relative";
   }
   const searchBar = buildSearchBar(container, searchAddon, () => terminal.focus());
-  const openSearch = (): void => {
+  const openSearch = (preset?: string): void => {
     searchBar.style.display = "flex";
     const input = searchBar.querySelector<HTMLInputElement>("input")!;
+    if (preset !== undefined && preset) {
+      input.value = preset;
+      searchAddon.findNext(preset);
+    }
     input.focus();
     input.select();
   };
+  const copySelection = (): void => {
+    const text = terminal.getSelection();
+    if (!text) return;
+    void copyToClipboard(text).then((ok) => {
+      if (!ok) {
+        notify(t("copyFailedExportHint"), "error");
+        return;
+      }
+      if (options.onCopied) options.onCopied(text.length);
+      else notify(`${t("copied")} ${text.length} ${t("charsUnit")}`, "info");
+    });
+  };
   terminal.attachCustomKeyEventHandler((event) => {
-    if (event.type === "keydown" && (event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "f") {
+    if (event.type === "keydown" && options.onKeyDown) {
+      const handled = options.onKeyDown(event);
+      if (handled === false) return false;
+    }
+    if (event.type !== "keydown") return true;
+    const key = event.key.toLowerCase();
+    const mod = event.ctrlKey || event.metaKey;
+    if (mod && !event.altKey && !event.shiftKey && key === "f") {
       event.preventDefault();
       openSearch();
       return false;
     }
+    // copy: in log mode (no pty) Ctrl/Cmd+C is free; an interactive shell
+    // keeps plain Ctrl+C for SIGINT and uses Ctrl+Shift+C instead.
+    // Ctrl+Insert is terminal-neutral and enabled everywhere.
+    const copyKey =
+      (options.logMode && mod && !event.shiftKey && key === "c") ||
+      (!options.logMode && event.ctrlKey && event.shiftKey && key === "c") ||
+      (event.ctrlKey && !event.shiftKey && key === "insert");
+    if (copyKey && terminal.hasSelection()) {
+      event.preventDefault();
+      copySelection();
+      return false;
+    }
+    // log mode owns Ctrl/Cmd+A: select the loaded buffer, not the page
+    if (options.logMode && mod && !event.altKey && !event.shiftKey && key === "a") {
+      event.preventDefault();
+      terminal.selectAll();
+      return false;
+    }
     return true;
   });
+
+  // stock context menu for interactive terminals (the log viewer installs
+  // its own); paste resolves lazily so the menu never blocks on clipboard
+  // permissions
+  if (!options.logMode) {
+    container.addEventListener("contextmenu", (event) => {
+      if (event.defaultPrevented) return;
+      event.preventDefault();
+      const items: MenuItem[] = [
+        { label: t("copy"), disabled: !terminal.hasSelection(), action: copySelection },
+        {
+          label: t("paste"),
+          action: () => {
+            void readClipboard().then((text) => {
+              if (text) terminal.paste(text);
+              else notify(t("clipboardUnavailable"), "error");
+            });
+          },
+        },
+        { separator: true },
+        { label: t("selectAll"), action: () => terminal.selectAll() },
+      ];
+      showContextMenu(items, event.clientX, event.clientY);
+      terminal.focus();
+    });
+  }
 
   // cwd reports: OSC 7 (our injected hooks, zsh/fish defaults) and OSC 9;9
   // (Windows conhost/PSReadLine). Returning false lets xterm keep its own

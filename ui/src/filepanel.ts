@@ -2,11 +2,12 @@
 // local bytes either from host fileTransfer handles (desktop) or plain File
 // objects (browser dev host) and stream them over the up/<transferId> binary
 // channel; downloads mirror that over down/<transferId>.
-import { bridge, handleFileName, handleFileSize, hasFileTransfer, type FileHandle } from "./host";
+import { bridge, handleFileName, handleFileSize, hasFileTransfer, copyToClipboard, type FileHandle } from "./host";
 import { icon } from "./icon";
 import { t } from "./i18n";
 import { notify, confirmBox, promptBox } from "./notify";
-import { createTerminal } from "./term";
+import { showContextMenu, closeContextMenu, type MenuItem } from "./menu";
+import { createTerminal, type TerminalHandle } from "./term";
 import { Highlighter } from "./highlight";
 import { createCodeEditor } from "./cmeditor";
 import { loadStyleSettings, onStyleSettingsChanged } from "./styleSettings";
@@ -1217,7 +1218,13 @@ export function createFilePanel(shellId: string, startDir?: string, connectionId
     title.textContent = path;
 
     const highlighter = new Highlighter({ enabled: true });
-    const term = createTerminal(body);
+    // logMode: read-only surface — Ctrl+C/A mean copy/select-all, double-click
+    // words break on log separators, Shift+Arrow selection is hooked in below
+    const term: TerminalHandle = createTerminal(body, "auto", {
+      logMode: true,
+      onCopied: (chars) => notify(`${t("copied")} ${chars} ${t("charsUnit")}`, "info"),
+      onKeyDown: (event) => onLogKeyDown(event),
+    });
     const filter = new LogLineFilter();
     // local color toggle on top of the plugin-wide setting: null = follow
     // the settings broadcast; once toggled here it stays local to this view
@@ -1266,6 +1273,8 @@ export function createFilePanel(shellId: string, startDir?: string, connectionId
       highlighter.setEnabled(colorOn);
       highlighter.setRules(settings.rules);
       term.setScheme(settings.scheme);
+      copyLineNumbers = settings.copyLineNumbers;
+      copyStripTimestamp = settings.copyStripTimestamp;
       syncColorButton();
     });
     detachSettings = onStyleSettingsChanged((settings) => {
@@ -1273,31 +1282,319 @@ export function createFilePanel(shellId: string, startDir?: string, connectionId
       highlighter.setEnabled(colorOn);
       highlighter.setRules(settings.rules);
       term.setScheme(settings.scheme);
+      copyLineNumbers = settings.copyLineNumbers;
+      copyStripTimestamp = settings.copyStripTimestamp;
       syncColorButton();
     });
 
-    // scroll lock on the xterm viewport
-    const viewport = body.querySelector<HTMLElement>(".xterm-viewport");
-    let atBottom = true;
+    // ---- follow state machine --------------------------------------------
+    // following → new output pins the view to the bottom
+    // paused-scroll → the user scrolled up; output accumulates, view is frozen
+    // paused-select → a selection exists; starting one pauses follow and
+    //                 clearing it resumes — selections must never be torn
+    //                 apart or dragged off-screen by the scroll pinning
+    type FollowState = "following" | "paused-scroll" | "paused-select";
+    let follow: FollowState = "following";
     let pendingLines = 0;
+    let copyLineNumbers = false;
+    let copyStripTimestamp = false;
+
+    const viewport = body.querySelector<HTMLElement>(".xterm-viewport");
     const refreshPill = (): void => {
-      jump.hidden = atBottom;
-      jump.textContent = `↓ ${pendingLines}`;
+      jump.hidden = false;
+      if (follow === "following") {
+        jump.className = "btn small log-jump following";
+        jump.innerHTML = `<span class="dot"></span>${t("followLive")}`;
+      } else {
+        jump.className = "btn small log-jump paused";
+        const count = pendingLines > 9999 ? "9999+" : String(pendingLines);
+        jump.innerHTML = `<span class="dot"></span>${t("followPaused")} ↓${count}`;
+      }
+    };
+    const resumeFollow = (): void => {
+      follow = "following";
+      pendingLines = 0;
+      term.terminal.clearSelection();
+      term.terminal.scrollToBottom();
+      refreshPill();
     };
     if (viewport) {
       viewport.addEventListener("scroll", () => {
         const bottom =
           viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 8;
-        if (bottom && !atBottom) pendingLines = 0;
-        atBottom = bottom;
+        if (bottom) {
+          // scrolling back to the bottom is an explicit "resume" in every
+          // paused state; a selection survives but the view starts moving
+          follow = "following";
+          pendingLines = 0;
+        } else if (follow === "following") {
+          follow = "paused-scroll";
+        }
         refreshPill();
       });
     }
     jump.addEventListener("click", () => {
-      atBottom = true;
-      pendingLines = 0;
-      term.terminal.scrollToBottom();
+      if (follow !== "following") resumeFollow();
+    });
+    refreshPill();
+
+    // ---- pixel → buffer cell translation ----------------------------------
+    // the renderer's cell metrics are the only exact source; guard every hop
+    // so a missing metric degrades features instead of throwing
+    const cellAt = (clientX: number, clientY: number): { row: number; col: number } | null => {
+      const screen = body.querySelector<HTMLElement>(".xterm-screen");
+      const cell = (term.terminal as unknown as {
+        _core?: { _renderService?: { dimensions?: { css?: { cell?: { width: number; height: number } } } } };
+      })._core?._renderService?.dimensions?.css?.cell;
+      if (!screen || !cell?.width || !cell?.height) return null;
+      const rect = screen.getBoundingClientRect();
+      const buffer = term.terminal.buffer.active;
+      const col = Math.max(0, Math.min(term.terminal.cols - 1, Math.floor((clientX - rect.left) / cell.width)));
+      const row = Math.max(
+        0,
+        Math.min(buffer.length - 1, buffer.viewportY + Math.floor((clientY - rect.top) / cell.height)),
+      );
+      return { row, col };
+    };
+    const lineTextAt = (clientY: number): string | null => {
+      const cell = cellAt(clientY, clientY);
+      if (!cell) return null;
+      return term.terminal.buffer.active.getLine(cell.row)?.translateToString(true) ?? null;
+    };
+
+    // ---- copy shaping ------------------------------------------------------
+    // leading timestamp column shapes seen in the wild: ISO-ish dates,
+    // time-only prefixes, bracketed log4j/logback stamps
+    const TIMESTAMP_PREFIX =
+      /^(?:\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\s*(?:Z|[+-]\d{2}:?\d{2})?\]?\s*|\[?\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?\]?\s*|\[\d{4}-\d{2}-\d{2}[^\]]*\]\s*)/;
+    const shapeCopy = (text: string, force?: { stripTimestamps?: boolean }): string => {
+      const strip = force?.stripTimestamps ?? copyStripTimestamp;
+      if (!strip && !copyLineNumbers) return text;
+      const lines = text.replace(/\n$/, "").split("\n");
+      const shaped = lines.map((line, index) => {
+        const body = strip ? line.replace(TIMESTAMP_PREFIX, "") : line;
+        return copyLineNumbers ? `${index + 1}: ${body}` : body;
+      });
+      return shaped.join("\n");
+    };
+    const doCopy = (text: string): void => {
+      if (!text) return;
+      if (text.length > 2 * 1024 * 1024) {
+        notify(`${t("copyLargeHint")} (${(text.length / 1024 / 1024).toFixed(1)} MB)`, "info");
+      }
+      void copyToClipboard(text).then((ok) => {
+        if (ok) notify(`${t("copied")} ${text.length} ${t("charsUnit")}`, "info");
+        else notify(t("copyFailedExportHint"), "error");
+      });
+    };
+    const copySelection = (force?: { stripTimestamps?: boolean }): void => {
+      if (!term.terminal.hasSelection()) return;
+      doCopy(shapeCopy(term.terminal.getSelection(), force));
+    };
+
+    // ---- export ------------------------------------------------------------
+    const fileBase = path.replace(/\\/g, "/").split("/").filter(Boolean).pop()?.replace(/\.[^.]+$/, "") || "log";
+    const exportText = (text: string, name: string): void => {
+      const plugin = bridge();
+      if (typeof plugin.fileTransfer?.beginSave !== "function") {
+        notify(t("exportUnavailable"), "error");
+        return;
+      }
+      const bytes = new TextEncoder().encode(text);
+      void (async () => {
+        try {
+          const handle = await plugin.fileTransfer!.beginSave({ name, size: bytes.length });
+          if (!handle) return; // user dismissed the save dialog
+          const chunkBytes = Math.max(4096, handle.chunkBytes || 65536);
+          for (let offset = 0; offset < bytes.length; offset += chunkBytes) {
+            const chunk = bytes.subarray(offset, Math.min(offset + chunkBytes, bytes.length));
+            await plugin.fileTransfer!.write(
+              handle.handleId,
+              offset,
+              plugin.encodeBase64 ? plugin.encodeBase64(chunk) : chunk,
+            );
+          }
+          await plugin.fileTransfer!.finish(handle.handleId);
+          notify(`${t("exportDone")}: ${name}`, "info");
+        } catch (error: unknown) {
+          notify(`${t("exportFailed")}: ${String((error as Error)?.message || error)}`, "error");
+        }
+      })();
+    };
+    const dumpLoaded = (): string => {
+      const buffer = term.terminal.buffer.active;
+      const parts: string[] = [];
+      for (let i = 0; i < buffer.length; i++) {
+        parts.push(buffer.getLine(i)?.translateToString(true) ?? "");
+      }
+      return parts.join("\n");
+    };
+
+    // ---- selection popover ---------------------------------------------------
+    const selPop = document.createElement("div");
+    selPop.className = "log-sel-pop";
+    selPop.style.display = "none";
+    for (const [label, action] of [
+      [t("copy"), () => copySelection()],
+      [t("findInLog"), () => term.openSearch(term.terminal.getSelection().trim())],
+    ] as const) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = label;
+      button.addEventListener("pointerdown", (event) => event.stopPropagation());
+      button.addEventListener("click", () => {
+        selPop.style.display = "none";
+        action();
+      });
+      selPop.append(button);
+    }
+    body.append(selPop);
+    const hideSelPop = (): void => {
+      selPop.style.display = "none";
+    };
+    let lastPointer = { x: 0, y: 0 };
+    body.addEventListener("pointerdown", (event) => {
+      lastPointer = { x: event.clientX, y: event.clientY };
+    });
+    body.addEventListener("pointerup", () => {
+      // xterm finalizes its selection inside the browser's mouseup path, so
+      // the check has to run one tick later
+      window.setTimeout(() => {
+        if (closed) return;
+        hideSelPop();
+        if (!term.terminal.hasSelection()) return;
+        const rect = body.getBoundingClientRect();
+        selPop.style.display = "flex";
+        const pop = selPop.getBoundingClientRect();
+        selPop.style.left = `${Math.max(4, Math.min(lastPointer.x - rect.left - 24, rect.width - pop.width - 6))}px`;
+        selPop.style.top = `${Math.max(4, lastPointer.y - rect.top - pop.height - 8)}px`;
+      }, 50);
+    });
+
+    // ---- selection ↔ follow wiring ------------------------------------------
+    term.terminal.onSelectionChange(() => {
+      if (term.terminal.hasSelection()) {
+        if (follow !== "paused-select") follow = "paused-select";
+      } else {
+        kbAnchor = null;
+        kbHead = null;
+        hideSelPop();
+        if (follow === "paused-select") {
+          follow = "following";
+          pendingLines = 0;
+          term.terminal.scrollToBottom();
+        }
+      }
       refreshPill();
+    });
+
+    // ---- shift+click selection extension -------------------------------------
+    // capture-phase mousedown: xterm listens on the screen element, so only a
+    // capturing listener can get between it and a shift-click meant to
+    // extend the current selection to whole lines
+    body.addEventListener(
+      "mousedown",
+      (event) => {
+        if (!event.shiftKey || event.button !== 0 || !term.terminal.hasSelection()) return;
+        const point = cellAt(event.clientX, event.clientY);
+        const range = term.terminal.getSelectionPosition();
+        if (!point || !range) return;
+        event.preventDefault();
+        event.stopPropagation();
+        // getSelectionPosition is 1-based, selectLines takes 0-based lines
+        const selStart = range.start.y - 1;
+        const selEnd = range.end.y - 1;
+        const top = Math.min(selStart, selEnd, point.row);
+        const bottom = Math.max(selStart, selEnd, point.row);
+        term.terminal.selectLines(top, bottom);
+      },
+      true,
+    );
+
+    // ---- keyboard selection ----------------------------------------------------
+    // whole-line oriented (Shift+Up/Down extend by lines, Home/End anchor the
+    // row, Left/Right stay within the row) — character-accurate cross-row
+    // keyboard selection is overkill for log triage and error-prone to build
+    // on the public select() API
+    let kbAnchor: { row: number; col: number } | null = null;
+    let kbHead: { row: number; col: number } | null = null;
+    function onLogKeyDown(event: KeyboardEvent): boolean {
+      if (!event.shiftKey || event.ctrlKey || event.metaKey || event.altKey) return true;
+      if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return true;
+      const buffer = term.terminal.buffer.active;
+      const cols = term.terminal.cols;
+      if (!kbHead) {
+        // continue from a mouse selection when one exists (1-based range →
+        // 0-based cells), else start at the output cursor
+        const range = term.terminal.getSelectionPosition();
+        if (range) {
+          kbAnchor = { row: range.start.y - 1, col: range.start.x - 1 };
+          kbHead = { row: range.end.y - 1, col: range.end.x - 1 };
+        } else {
+          kbAnchor = { row: buffer.baseY + buffer.cursorY, col: buffer.cursorX };
+          kbHead = { ...kbAnchor };
+        }
+      }
+      const head = { ...kbHead };
+      if (event.key === "ArrowUp") head.row -= 1;
+      else if (event.key === "ArrowDown") head.row += 1;
+      else if (event.key === "ArrowLeft") head.col = Math.max(0, head.col - 1);
+      else if (event.key === "ArrowRight") head.col = Math.min(cols - 1, head.col + 1);
+      else if (event.key === "Home") head.col = 0;
+      else head.col = cols - 1;
+      head.row = Math.max(0, Math.min(buffer.length - 1, head.row));
+      kbHead = head;
+      const anchor = kbAnchor!;
+      if (anchor.row === head.row) {
+        term.terminal.select(Math.min(anchor.col, head.col), anchor.row, Math.abs(anchor.col - head.col));
+      } else {
+        term.terminal.selectLines(Math.min(anchor.row, head.row), Math.max(anchor.row, head.row));
+      }
+      event.preventDefault();
+      return false;
+    }
+
+    // ---- context menu ----------------------------------------------------------
+    body.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      hideSelPop();
+      closeContextMenu();
+      const hasSel = term.terminal.hasSelection();
+      const selection = term.terminal.getSelection();
+      const line = lineTextAt(event.clientY);
+      const items: MenuItem[] = [];
+      if (hasSel) {
+        items.push({ label: t("copy"), action: () => copySelection() });
+        // one-shot variant entries (FR-3.4): the opposite of the configured
+        // default, so either preference keeps its escape hatch
+        items.push(
+          copyLineNumbers || copyStripTimestamp
+            ? { label: t("copyRaw"), action: () => doCopy(selection) }
+            : { label: t("copyNoTimestamp"), action: () => copySelection({ stripTimestamps: true }) },
+        );
+      }
+      if (line) items.push({ label: t("copyCurrentLine"), action: () => doCopy(shapeCopy(line)) });
+      if (hasSel && selection.trim()) {
+        const needle = selection.trim();
+        const clip = needle.length > 24 ? `${needle.slice(0, 24)}…` : needle;
+        items.push({ label: `${t("findInLog")} “${clip.replace(/"/g, "”")}”`, action: () => term.openSearch(needle) });
+      }
+      items.push({ label: t("selectAll"), action: () => term.terminal.selectAll() });
+      items.push({ separator: true });
+      items.push(
+        hasSel
+          ? {
+              label: t("exportSelection"),
+              action: () => exportText(shapeCopy(selection), `${fileBase}.selection.log`),
+            }
+          : { label: t("exportLoaded"), action: () => exportText(dumpLoaded(), `${fileBase}.log`) },
+      );
+      if (follow === "following") {
+        items.push({ label: t("pauseFollow"), action: () => { follow = "paused-scroll"; refreshPill(); } });
+      } else {
+        items.push({ label: t("resumeFollow"), action: resumeFollow });
+      }
+      showContextMenu(items, event.clientX, event.clientY);
     });
 
     detachEvents = onSidecarEvent((message) => {
@@ -1321,7 +1618,7 @@ export function createFilePanel(shellId: string, startDir?: string, connectionId
         detachChannel = onBinaryChannel(`tail/${taskId}`, (data) => {
           const styled = filter.process(highlighter.process(data));
           term.write(styled);
-          if (atBottom) {
+          if (follow === "following") {
             term.terminal.scrollToBottom();
           } else {
             for (const byte of styled) pendingLines += byte === 0x0a ? 1 : 0;

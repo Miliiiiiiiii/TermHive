@@ -41,6 +41,10 @@ export interface StyleSettings {
   fontFamily: string;
   fontSize: number;
   scrollback: number;
+  /** log-viewer copy shaping: prefix each copied line with its 1-based number */
+  copyLineNumbers: boolean;
+  /** log-viewer copy shaping: strip a leading timestamp column from copied lines */
+  copyStripTimestamp: boolean;
   /** saved file-panel paths per connectionId */
   favorites: Record<string, string[]>;
 }
@@ -62,6 +66,8 @@ export function defaultStyleSettings(): StyleSettings {
     fontFamily: "",
     fontSize: 13,
     scrollback: 5000,
+    copyLineNumbers: false,
+    copyStripTimestamp: false,
     favorites: {},
   };
 }
@@ -82,6 +88,8 @@ type StoredSettings = {
   fontFamily?: string;
   fontSize?: number;
   scrollback?: number;
+  copyLineNumbers?: boolean;
+  copyStripTimestamp?: boolean;
   favorites?: Record<string, string[]>;
 };
 
@@ -133,6 +141,8 @@ function applyStored(settings: StyleSettings, stored: StoredSettings): void {
   if (typeof stored.scrollback === "number" && Number.isFinite(stored.scrollback)) {
     settings.scrollback = Math.min(100000, Math.max(500, Math.round(stored.scrollback)));
   }
+  if (typeof stored.copyLineNumbers === "boolean") settings.copyLineNumbers = stored.copyLineNumbers;
+  if (typeof stored.copyStripTimestamp === "boolean") settings.copyStripTimestamp = stored.copyStripTimestamp;
   if (stored.favorites && typeof stored.favorites === "object" && !Array.isArray(stored.favorites)) {
     const favorites: Record<string, string[]> = {};
     for (const [key, value] of Object.entries(stored.favorites)) {
@@ -179,6 +189,8 @@ export function saveStyleSettings(settings: StyleSettings): void {
           fontFamily: settings.fontFamily,
           fontSize: settings.fontSize,
           scrollback: settings.scrollback,
+          copyLineNumbers: settings.copyLineNumbers,
+          copyStripTimestamp: settings.copyStripTimestamp,
           favorites: settings.favorites,
         },
       },
@@ -548,6 +560,16 @@ export function renderStylePop(
   schemeSelect.value = state.scheme;
   schemeSelect.addEventListener("change", () => commit((draft) => (draft.scheme = schemeSelect.value)));
   settingCard(t("schemeLabel"), t("schemeDesc"), schemeSelect);
+
+  // log-viewer copy shaping: line-number prefixes and timestamp stripping
+  // apply to every copy action in the log viewer; the context menu always
+  // offers a one-shot escape hatch in the other direction
+  {
+    const lineNumbers = makeSwitch(state.copyLineNumbers, (value) => commit((draft) => (draft.copyLineNumbers = value)), true);
+    settingCard(t("copyLineNumbersLabel"), t("copyLineNumbersDesc"), lineNumbers);
+    const stripTs = makeSwitch(state.copyStripTimestamp, (value) => commit((draft) => (draft.copyStripTimestamp = value)), true);
+    settingCard(t("copyStripTimestampLabel"), t("copyStripTimestampDesc"), stripTs);
+  }
 
   // terminal font: custom family ("" = follow the host) + size in px
   {

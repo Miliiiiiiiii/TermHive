@@ -100,6 +100,61 @@ declare global {
 
 export const bridge = (): DbxPluginBridge => window.dbxPlugin;
 
+// Copy through the best available channel: the host bridge first (it owns
+// the real clipboard in the sandboxed webview), then the async clipboard
+// API, then a hidden-textarea execCommand fallback. Returns false only when
+// every channel refused, so callers can suggest exporting to a file — a
+// denied clipboard must not fail silently.
+export async function copyToClipboard(text: string): Promise<boolean> {
+  const plugin = window.dbxPlugin;
+  try {
+    if (typeof plugin?.copy === "function") {
+      await plugin.copy(text);
+      return true;
+    }
+  } catch {
+    /* fall through to the next channel */
+  }
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    /* fall through */
+  }
+  try {
+    const helper = document.createElement("textarea");
+    helper.value = text;
+    helper.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0;";
+    document.body.append(helper);
+    helper.select();
+    const ok = document.execCommand("copy");
+    helper.remove();
+    if (ok) return true;
+  } catch {
+    /* all channels failed */
+  }
+  return false;
+}
+
+// Best-effort clipboard read for terminal paste menus; null when the host
+// environment withholds the clipboard (permissions UI, sandbox policy).
+export async function readClipboard(): Promise<string | null> {
+  const plugin = window.dbxPlugin;
+  try {
+    if (typeof plugin?.clipboard?.readText === "function") return await plugin.clipboard.readText();
+  } catch {
+    /* fall through */
+  }
+  try {
+    if (navigator.clipboard?.readText) return await navigator.clipboard.readText();
+  } catch {
+    /* denied */
+  }
+  return null;
+}
+
 export function hasFloating(): boolean {
   return typeof bridge().floating?.open === "function";
 }

@@ -1075,7 +1075,8 @@ input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):focus, selec
   color: var(--text);
 }
 .log-card .editor-head .btn.active { color: var(--accent); border-color: var(--accent); }
-/* jump-to-latest pill: visible while the viewer is paused (scrolled up) */
+/* follow-state pill: always visible — "● following" or "⏸ paused ↓N"; click
+   resumes. Doubles as the new-output counter while paused. */
 .log-jump {
   position: absolute;
   right: 18px;
@@ -1086,6 +1087,37 @@ input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):focus, selec
   padding: 4px 12px;
   cursor: pointer;
 }
+.log-jump .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: 0; }
+.log-jump.following { color: var(--text-dim); cursor: default; }
+.log-jump.following .dot { background: var(--ok, #22c55e); animation: log-dot-breath 2s ease-in-out infinite; }
+.log-jump.paused .dot { background: var(--warn, #f59e0b); }
+@keyframes log-dot-breath { 50% { opacity: 0.35; } }
+/* text-selection cursor over the log surface */
+.log-body .xterm-screen { cursor: text; }
+/* mini popover above a finished drag selection: copy / find */
+.log-sel-pop {
+  position: absolute;
+  z-index: 8;
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  box-shadow: var(--shadow-pop);
+}
+.log-sel-pop button {
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.log-sel-pop button:hover { background: var(--bg-hover); }
+/* context menu separator */
+.ctx-sep { height: 1px; margin: 4px 6px; background: var(--border-soft); }
 
 /* refresh feedback: spin the icon while the listing reloads */
 @keyframes fp-spin { to { transform: rotate(360deg); } }
