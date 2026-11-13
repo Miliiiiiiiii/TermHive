@@ -526,78 +526,88 @@ export function createFilePanel(shellId: string, startDir?: string, connectionId
     return (async () => {
       const { transferId } = await api<{ transferId: string }>("transfer/startUpload", { shellId, remotePath: target, size: source.size }, 60000);
       item.transferId = transferId;
-      // pipelined dispatch: keep up to UPLOAD_WINDOW chunks in flight — the
-      // backend writes them concurrently (WriteAt), so large uploads no
-      // longer pay one RTT per chunk
-      let sendOffset = 0;
-      let ackedBytes = 0;
-      let outstanding = 0;
-      while (ackedBytes < source.size && !canceled) {
-        while (outstanding < UPLOAD_WINDOW && sendOffset < source.size) {
-          const chunk = await source.read(sendOffset, Math.min(UPLOAD_CHUNK, source.size - sendOffset));
-          sendBinary(`up/${transferId}`, chunk);
-          sendOffset += chunk.length;
-          outstanding += 1;
+      // One persistent listener feeding a queue, instead of a fresh listener
+      // per awaited event: acks that landed while the loop was busy reading
+      // the next chunk found no listener and vanished, freezing the bar and
+      // leaking flight-window slots — the file still arrived because
+      // transfer.done eventually got caught.
+      const pending: { method: string; params: any }[] = [];
+      let wake: (() => void) | null = null;
+      const offEvents = onSidecarEvent((message) => {
+        if (message.method !== "transfer.ack" && message.method !== "transfer.done") return;
+        if (message.params?.transferId !== transferId) return;
+        pending.push(message);
+        wake?.();
+      });
+      const nextEvent = (timeoutMs: number) => {
+        const head = pending.shift();
+        if (head) return Promise.resolve(head);
+        return new Promise<{ method: string; params: any }>((resolve, reject) => {
+          const timer = setTimeout(() => {
+            wake = null;
+            reject(new Error("传输超时"));
+          }, timeoutMs);
+          wake = () => {
+            clearTimeout(timer);
+            wake = null;
+            const event = pending.shift();
+            if (event) resolve(event);
+          };
+        });
+      };
+      try {
+        // pipelined dispatch: keep up to UPLOAD_WINDOW chunks in flight — the
+        // backend writes them concurrently (WriteAt), so large uploads no
+        // longer pay one RTT per chunk
+        let sendOffset = 0;
+        let ackedBytes = 0;
+        let outstanding = 0;
+        while (ackedBytes < source.size && !canceled) {
+          while (outstanding < UPLOAD_WINDOW && sendOffset < source.size) {
+            const chunk = await source.read(sendOffset, Math.min(UPLOAD_CHUNK, source.size - sendOffset));
+            sendBinary(`up/${transferId}`, chunk);
+            sendOffset += chunk.length;
+            outstanding += 1;
+          }
+          const event = await nextEvent(120000);
+          if (event.method === "transfer.done") {
+            if (!event.params.ok) throw new Error(event.params.error || "upload failed");
+            ackedBytes = source.size;
+            break;
+          }
+          ackedBytes = Math.max(ackedBytes, (event.params?.received as number) ?? 0);
+          outstanding = Math.max(0, outstanding - 1);
+          item.bytes = ackedBytes;
+          updateItem(item);
         }
-        const event = await waitForTransferEvent(transferId, 120000);
-        if (event.method === "transfer.done") {
-          if (!event.params.ok) throw new Error(event.params.error || "upload failed");
-          ackedBytes = source.size;
-          break;
+        if (canceled) return;
+        if (item.bytes < source.size) {
+          // drain queued acks until done arrives, topping up the counter as
+          // they pass — the last ack may not carry the full byte count
+          for (;;) {
+            const event = await nextEvent(120000);
+            if (event.method === "transfer.done") {
+              if (!event.params.ok) throw new Error(event.params.error || "upload failed");
+              break;
+            }
+            item.bytes = Math.max(item.bytes, (event.params?.received as number) ?? item.bytes);
+            updateItem(item);
+          }
+          item.bytes = source.size;
         }
-        ackedBytes = Math.max(ackedBytes, (event.params?.received as number) ?? 0);
-        outstanding = Math.max(0, outstanding - 1);
-        item.bytes = ackedBytes;
-        updateItem(item);
-      }
-      if (canceled) return;
-      if (item.bytes < source.size) {
-        // ensure the done event has arrived before declaring success
-        await waitForTransferDone(transferId, 120000);
+        await source.finish?.();
+        item.status = "done";
         item.bytes = source.size;
+        updateItem(item);
+      } finally {
+        offEvents();
       }
-      await source.finish?.();
-      item.status = "done";
-      item.bytes = source.size;
-      updateItem(item);
     })().catch((error) => {
       if (canceled) return;
       item.status = "failed";
       item.error = error.message;
       updateItem(item);
       source.cancel?.();
-    });
-  }
-
-  function waitForTransferEvent(transferId: string, timeoutMs: number) {
-    return new Promise<{ method: string; params: any }>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        off();
-        reject(new Error("传输超时"));
-      }, timeoutMs);
-      const off = onSidecarEvent((message) => {
-        if (message.method !== "transfer.ack" && message.method !== "transfer.done") return;
-        if (message.params?.transferId !== transferId) return;
-        clearTimeout(timer);
-        off();
-        resolve(message as { method: string; params: any });
-      });
-    });
-  }
-
-  function waitForTransferDone(transferId: string, timeoutMs: number) {
-    return new Promise<{ method: string; params: any }>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        off();
-        reject(new Error("传输超时"));
-      }, timeoutMs);
-      const off = onSidecarEvent((message) => {
-        if (message.method !== "transfer.done" || message.params?.transferId !== transferId) return;
-        clearTimeout(timer);
-        off();
-        if (!message.params.ok) reject(new Error(message.params.error || "upload failed"));
-        else resolve(message as { method: string; params: any });
-      });
     });
   }
 
