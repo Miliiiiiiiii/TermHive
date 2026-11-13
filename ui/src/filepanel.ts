@@ -531,7 +531,7 @@ export function createFilePanel(shellId: string, startDir?: string, connectionId
       // the next chunk found no listener and vanished, freezing the bar and
       // leaking flight-window slots — the file still arrived because
       // transfer.done eventually got caught.
-      const pending: { method: string; params: any }[] = [];
+      const pending: { method: string; params?: any }[] = [];
       let wake: (() => void) | null = null;
       const offEvents = onSidecarEvent((message) => {
         if (message.method !== "transfer.ack" && message.method !== "transfer.done") return;
@@ -539,10 +539,10 @@ export function createFilePanel(shellId: string, startDir?: string, connectionId
         pending.push(message);
         wake?.();
       });
-      const nextEvent = (timeoutMs: number) => {
+      const nextEvent = (timeoutMs: number): Promise<{ method: string; params?: any }> => {
         const head = pending.shift();
         if (head) return Promise.resolve(head);
-        return new Promise<{ method: string; params: any }>((resolve, reject) => {
+        return new Promise<{ method: string; params?: any }>((resolve, reject) => {
           const timer = setTimeout(() => {
             wake = null;
             reject(new Error("传输超时"));
@@ -571,7 +571,7 @@ export function createFilePanel(shellId: string, startDir?: string, connectionId
           }
           const event = await nextEvent(120000);
           if (event.method === "transfer.done") {
-            if (!event.params.ok) throw new Error(event.params.error || "upload failed");
+            if (!event.params?.ok) throw new Error(event.params?.error || "upload failed");
             ackedBytes = source.size;
             break;
           }
@@ -587,7 +587,7 @@ export function createFilePanel(shellId: string, startDir?: string, connectionId
           for (;;) {
             const event = await nextEvent(120000);
             if (event.method === "transfer.done") {
-              if (!event.params.ok) throw new Error(event.params.error || "upload failed");
+              if (!event.params?.ok) throw new Error(event.params?.error || "upload failed");
               break;
             }
             item.bytes = Math.max(item.bytes, (event.params?.received as number) ?? item.bytes);
