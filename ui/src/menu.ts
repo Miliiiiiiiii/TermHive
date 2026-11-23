@@ -20,6 +20,20 @@ export function showContextMenu(items: MenuItem[], x: number, y: number): void {
   closeContextMenu();
   const menu = document.createElement("div");
   menu.className = "ctx-menu ctx-float";
+
+  // Menu buttons take focus when clicked, and removing the menu would strand
+  // focus on <body>. Remember the last element focused outside the menu so
+  // picking an item or dismissing with Escape hands focus back — a terminal
+  // must keep taking keystrokes right after a menu paste.
+  let returnFocus: Element | null = document.activeElement;
+  const onFocusIn = (event: FocusEvent): void => {
+    const target = event.target;
+    if (target instanceof HTMLElement && !menu.contains(target)) returnFocus = target;
+  };
+  const restoreFocus = (): void => {
+    if (returnFocus instanceof HTMLElement && returnFocus.isConnected) returnFocus.focus();
+  };
+
   for (const item of items) {
     if (item.separator) {
       const sep = document.createElement("div");
@@ -34,6 +48,9 @@ export function showContextMenu(items: MenuItem[], x: number, y: number): void {
     entry.textContent = item.label ?? "";
     entry.addEventListener("click", () => {
       close();
+      // before the action: an action that opens a prompt or a search box
+      // owns the focus from that point on
+      restoreFocus();
       item.action?.();
     });
     menu.append(entry);
@@ -42,14 +59,19 @@ export function showContextMenu(items: MenuItem[], x: number, y: number): void {
     menu.remove();
     window.removeEventListener("pointerdown", onDown, true);
     window.removeEventListener("keydown", onKey, true);
+    window.removeEventListener("focusin", onFocusIn, true);
     window.removeEventListener("resize", close);
     if (activeClose === close) activeClose = null;
   };
   const onDown = (event: PointerEvent): void => {
+    // an outside press closes without restoring: whatever was pressed takes
+    // the focus by itself
     if (!menu.contains(event.target as Node)) close();
   };
   const onKey = (event: KeyboardEvent): void => {
-    if (event.key === "Escape") close();
+    if (event.key !== "Escape") return;
+    close();
+    restoreFocus();
   };
   activeClose = close;
   document.body.append(menu);
@@ -58,5 +80,6 @@ export function showContextMenu(items: MenuItem[], x: number, y: number): void {
   menu.style.top = `${Math.max(4, Math.min(y, window.innerHeight - rect.height - 8))}px`;
   window.addEventListener("pointerdown", onDown, true);
   window.addEventListener("keydown", onKey, true);
+  window.addEventListener("focusin", onFocusIn, true);
   window.addEventListener("resize", close);
 }

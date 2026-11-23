@@ -80,6 +80,8 @@ export function installMockBridge(context: Record<string, unknown>): void {
   const eventHandlers = new Set<EventHandler>();
   let history = "";
   let counter = 0;
+  let mockClipboard = "";
+  const stored: Record<string, unknown> = {};
   const encoder = new TextEncoder();
   const push = (channel: string, data: string | Uint8Array): void => {
     binaryHandlers.forEach((handler) =>
@@ -131,8 +133,13 @@ export function installMockBridge(context: Record<string, unknown>): void {
             ],
           };
         case "settings/get":
-          return { settings: {} };
+          return { settings: stored };
         case "settings/put":
+          // like the real sidecar: merge, then tell every surface
+          Object.assign(stored, (params.settings ?? {}) as Record<string, unknown>);
+          eventHandlers.forEach((handler) =>
+            handler({ method: "settings.changed", params: { settings: { ...stored } } }),
+          );
           return { ok: true };
         case "session/shells":
           return [{ ...demo, closed: false, createdAt: Date.now(), primary: true }];
@@ -240,7 +247,19 @@ export function installMockBridge(context: Record<string, unknown>): void {
       handler(context as any);
       return () => undefined;
     },
-    copy: async () => undefined,
+    // mirror the real bridge: writes land on the (mock) system clipboard, the
+    // capability flag advertises scripted reads, and copy/clipboard.writeText
+    // are one and the same channel
+    capabilities: { clipboardRead: true, clipboardWrite: true },
+    copy: async (text: string) => {
+      mockClipboard = text;
+    },
+    clipboard: {
+      writeText: async (text: string) => {
+        mockClipboard = text;
+      },
+      readText: async () => mockClipboard,
+    },
     setTitle: async () => undefined,
     closeWorkbench: async () => undefined,
     encodeBase64: (data: Uint8Array) => btoa(String.fromCharCode(...data)),

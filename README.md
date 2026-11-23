@@ -28,6 +28,7 @@ DBX 插件：SSH 终端 + SFTP 文件管理。连接保存在 DBX 原生连接�
 - **AI 工具（MCP）**：12 个工具三档对外授权（只读 / 写 / full）——白名单只读命令分类器（按 shell 家族词法判定）、只读日志跟随三件套 `tail_start/tail_read/tail_stop`（服务端拼装命令、连接即作用域、空闲自动回收）、灾难模式硬拒、写操作逐次弹窗批准、调用进 diag.log 与 DBX 审计
 - **传输性能**：大文件下载走并发分块读（严格按序重组），下载缓冲内存池化；SFTP 通道断线自愈重建
 - **终端体验**：xterm.js WebGL GPU 渲染（自动降级）；Ctrl+F 悬浮搜索栏；链接可点击；输出微批合帧（高吞吐刷屏更顺）；4ms 内交互零感知
+- **复制 / 粘贴**：选中后 Ctrl+Insert 或 Ctrl+Shift+C 复制，Shift+Insert 或右键菜单"粘贴"（Ctrl+C 仍是中断信号）。"Ctrl+V 粘贴"可在设置页开关，默认开；关闭后 Ctrl+V 原样发给服务器（^V）。右键粘贴需要读取剪贴板，因此插件声明了 DBX 的 `host.clipboard:read` 权限——每个工作台会话的第一次右键粘贴，DBX 会询问是否允许
 - **凭据安全落盘**：重连凭据缓存以密封信封落盘（Windows DPAPI / 其他平台 AES-256-GCM），明文只存在于内存——重启后仍可独立重拨
 - **浮窗小屏**：桌面端可把会话拉出为置顶迷你终端（`floating` API，每个贡献点一个窗口）
 - **断线恢复**：断线显示"重新连接"（或自动重连中）；历史输出环形缓冲（128KB）attach 回放
@@ -50,7 +51,7 @@ backend/                  Go sidecar（x/crypto/ssh + pkg/sftp）
   hostkey.go              服务器指纹库（TOFU known_hosts）
   secrets*.go             凭据密封（DPAPI / AES-GCM）
   fs.go / editor.go       RemoteFS 抽象 / 远程编辑器
-manifest.json             stdio-framed 传输，权限 host.workbench/binary/events/ai
+manifest.json             stdio-framed 传输，权限 host.workbench/binary/events/ai/clipboard:read
 scripts/                  proto-test / e2e-test（内嵌 SSH+SFTP 测试服务器）/ build-ui
 tools/testsrv/            仅测试用的本地 SSH+SFTP 服务器
 docs/ROADMAP.md           功能发展报告与路线图
@@ -60,7 +61,7 @@ docs/ROADMAP.md           功能发展报告与路线图
 
 ## 开发
 
-前置：Node 22+、Go 1.22+、DBX ≥ 0.5.68。
+前置：Node 22+、Go 1.22+、DBX ≥ 0.6.23（`host.clipboard:read` 权限自该版本起才被识别）。
 
 ```bash
 npm install && npm --prefix ui install                      # 首次（根 + ui 两套依赖）
@@ -105,7 +106,7 @@ Highlights:
 - **Auto-reconnect** — exponential backoff (2s→60s), off-switch in settings; auth failures and host-key changes are treated as permanent
 - **Session logging** — optional timestamped terminal transcripts under `<dataDir>/logs/<user@host_port>/`
 - **AI tools (MCP)** — 12 tools with three-tier exposure: a whitelist-based read-only command classifier, read-only log-follow tasks (`tail_start`/`tail_read`/`tail_stop`), catastrophic-pattern hard refusal and per-call approval for writes
-- **Terminal feel** — xterm.js WebGL rendering, floating mini terminal, 128KB reconnect replay buffer
+- **Terminal feel** — xterm.js WebGL rendering, floating mini terminal, 128KB reconnect replay buffer; copy with Ctrl+Insert / Ctrl+Shift+C and paste with Shift+Insert or the context menu (Ctrl+C stays interrupt); "paste with Ctrl+V" is a setting, on by default. The context-menu paste reads the clipboard through the `host.clipboard:read` host permission, so DBX asks for consent on the first paste of each workbench session
 
 ## License
 

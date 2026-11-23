@@ -2,7 +2,7 @@
 import { bridge, hasFloating } from "../host";
 import { icon } from "../icon";
 import { t } from "../i18n";
-import { createTerminal, type TerminalHandle } from "../term";
+import { createTerminal, defaultTerminalStyle, type TerminalHandle, type TerminalStyle } from "../term";
 import { Highlighter } from "../highlight";
 import { loadStyleSettings, onStyleSettingsChanged } from "../styleSettings";
 import { api, listShells, onBinaryChannel, onSidecarEvent, sendBinary } from "../rpc";
@@ -41,13 +41,18 @@ export async function mountMini(context: MiniContext): Promise<() => void> {
   if (context.name) title.textContent = context.name;
 
   // plugin-wide style settings: same blob as every other surface, and live
-  // updates when one of them changes it (settings.changed broadcast)
+  // updates when one of them changes it (settings.changed broadcast). The
+  // mini window keeps the stock font/scrollback; only the key binding rides
+  // on the style object because that is the terminals' live-update channel.
   const styleState = await loadStyleSettings();
-  const term: TerminalHandle = createTerminal(termWrap, styleState.scheme);
+  const miniStyle = (): TerminalStyle => ({ ...defaultTerminalStyle(), ctrlVPaste: styleState.ctrlVPaste });
+  const term: TerminalHandle = createTerminal(termWrap, styleState.scheme, { style: miniStyle() });
   const highlighter = new Highlighter({ enabled: styleState.highlight, rules: styleState.rules });
   const offBinary = onBinaryChannel(`term/${shellId}`, (data) => term.write(highlighter.process(data)));
   const offStyleEvent = onStyleSettingsChanged((next) => {
+    Object.assign(styleState, next);
     term.setScheme(next.scheme);
+    term.applyStyle(miniStyle());
     highlighter.setEnabled(next.highlight);
     highlighter.setRules(next.rules);
   });

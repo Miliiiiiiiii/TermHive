@@ -41,6 +41,8 @@ export interface StyleSettings {
   fontFamily: string;
   fontSize: number;
   scrollback: number;
+  /** Ctrl+V pastes the clipboard instead of sending ^V to the shell */
+  ctrlVPaste: boolean;
   /** log-viewer copy shaping: prefix each copied line with its 1-based number */
   copyLineNumbers: boolean;
   /** log-viewer copy shaping: strip a leading timestamp column from copied lines */
@@ -66,6 +68,7 @@ export function defaultStyleSettings(): StyleSettings {
     fontFamily: "",
     fontSize: 13,
     scrollback: 5000,
+    ctrlVPaste: true,
     copyLineNumbers: false,
     copyStripTimestamp: false,
     favorites: {},
@@ -88,6 +91,7 @@ type StoredSettings = {
   fontFamily?: string;
   fontSize?: number;
   scrollback?: number;
+  ctrlVPaste?: boolean;
   copyLineNumbers?: boolean;
   copyStripTimestamp?: boolean;
   favorites?: Record<string, string[]>;
@@ -141,6 +145,7 @@ function applyStored(settings: StyleSettings, stored: StoredSettings): void {
   if (typeof stored.scrollback === "number" && Number.isFinite(stored.scrollback)) {
     settings.scrollback = Math.min(100000, Math.max(500, Math.round(stored.scrollback)));
   }
+  if (typeof stored.ctrlVPaste === "boolean") settings.ctrlVPaste = stored.ctrlVPaste;
   if (typeof stored.copyLineNumbers === "boolean") settings.copyLineNumbers = stored.copyLineNumbers;
   if (typeof stored.copyStripTimestamp === "boolean") settings.copyStripTimestamp = stored.copyStripTimestamp;
   if (stored.favorites && typeof stored.favorites === "object" && !Array.isArray(stored.favorites)) {
@@ -189,6 +194,7 @@ export function saveStyleSettings(settings: StyleSettings): void {
           fontFamily: settings.fontFamily,
           fontSize: settings.fontSize,
           scrollback: settings.scrollback,
+          ctrlVPaste: settings.ctrlVPaste,
           copyLineNumbers: settings.copyLineNumbers,
           copyStripTimestamp: settings.copyStripTimestamp,
           favorites: settings.favorites,
@@ -607,6 +613,11 @@ export function renderStylePop(
     ctl.append(scrollInput, unitSpan(t("linesUnit")));
     settingCard(t("scrollbackLabel"), t("scrollbackDesc"), null).append(ctl);
   }
+  settingCard(
+    t("ctrlVPasteLabel"),
+    t("ctrlVPasteDesc"),
+    makeSwitch(state.ctrlVPaste, (value) => commit((draft) => (draft.ctrlVPaste = value))),
+  );
 
   // auto-reconnect carries its give-up budget: after this many failed redials
   // the supervisor stops and the manual-reconnect overlay takes over (an

@@ -84,6 +84,10 @@ export interface DbxPluginBridge {
   readAsset?(path: string): Promise<unknown>;
   copy?(text: string): Promise<unknown>;
   clipboard?: { writeText?(text: string): Promise<unknown>; readText?(): Promise<string> };
+  // Host API groups this host can serve, reported in the init message. An
+  // older host omits the whole object and any group it lacks is false there,
+  // so gate calls on the flag instead of probing.
+  readonly capabilities?: { clipboardRead?: boolean; clipboardWrite?: boolean };
   setTitle?(title: string | null): Promise<unknown>;
   closeWorkbench?(): Promise<unknown>;
   floating?: FloatingApi;
@@ -138,21 +142,48 @@ export async function copyToClipboard(text: string): Promise<boolean> {
   return false;
 }
 
-// Best-effort clipboard read for terminal paste menus; null when the host
-// environment withholds the clipboard (permissions UI, sandbox policy).
-export async function readClipboard(): Promise<string | null> {
+// Why a scripted clipboard read failed. Callers turn the reason into a hint
+// that names the keyboard paste path (Shift+Insert) — that path is a native
+// paste event and needs none of this.
+export type ClipboardReadFailure = "unsupported" | "denied" | "busy" | "failed";
+
+export type ClipboardReadResult = { ok: true; text: string } | { ok: false; reason: ClipboardReadFailure };
+
+// the host allows one scripted read per second; wait out the window once
+// before reporting a busy clipboard
+const CLIPBOARD_READ_RETRY_MS = 1100;
+
+const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error ?? ""));
+
+// Scripted clipboard read for the terminal's context-menu paste. The plugin
+// iframe is sandboxed with an opaque origin, so `navigator.clipboard` is
+// refused there; the real channel is the host bridge's `clipboard.readText`,
+// which needs `host.clipboard:read` in the manifest, asks the user's consent
+// once per workbench session and is rate-limited to one read per second.
+// Without the capability (older host, dev host) the async clipboard API is
+// tried instead — it works in a plain browser tab.
+export async function readClipboard(retried = false): Promise<ClipboardReadResult> {
   const plugin = window.dbxPlugin;
-  try {
-    if (typeof plugin?.clipboard?.readText === "function") return await plugin.clipboard.readText();
-  } catch {
-    /* fall through */
+  if (plugin?.capabilities?.clipboardRead && typeof plugin.clipboard?.readText === "function") {
+    try {
+      return { ok: true, text: await plugin.clipboard.readText() };
+    } catch (error) {
+      const message = errorText(error);
+      if (/rate limit/i.test(message)) {
+        if (retried) return { ok: false, reason: "busy" };
+        await new Promise((resolve) => window.setTimeout(resolve, CLIPBOARD_READ_RETRY_MS));
+        return readClipboard(true);
+      }
+      if (/denied/i.test(message)) return { ok: false, reason: "denied" };
+      return { ok: false, reason: "failed" };
+    }
   }
   try {
-    if (navigator.clipboard?.readText) return await navigator.clipboard.readText();
+    if (navigator.clipboard?.readText) return { ok: true, text: await navigator.clipboard.readText() };
   } catch {
-    /* denied */
+    /* no readable clipboard in this environment */
   }
-  return null;
+  return { ok: false, reason: "unsupported" };
 }
 
 export function hasFloating(): boolean {

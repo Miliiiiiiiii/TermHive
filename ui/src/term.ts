@@ -7,9 +7,9 @@ import { SearchAddon } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { findScheme } from "./theme";
-import { copyToClipboard, readClipboard } from "./host";
+import { copyToClipboard, readClipboard, type ClipboardReadFailure } from "./host";
 import { showContextMenu, type MenuItem } from "./menu";
-import { t } from "./i18n";
+import { t, type MessageKey } from "./i18n";
 import { notify } from "./notify";
 import "@xterm/xterm/css/xterm.css";
 
@@ -54,10 +54,12 @@ export interface TerminalStyle {
   fontFamily: string;
   fontSize: number;
   scrollback: number;
+  /** Ctrl+V pastes instead of sending ^V to the shell (see the key handler) */
+  ctrlVPaste: boolean;
 }
 
 export function defaultTerminalStyle(): TerminalStyle {
-  return { fontFamily: "", fontSize: 13, scrollback: 5000 };
+  return { fontFamily: "", fontSize: 13, scrollback: 5000, ctrlVPaste: true };
 }
 
 export interface TerminalHandle {
@@ -284,6 +286,25 @@ export function createTerminal(
       openSearch();
       return false;
     }
+    // Ctrl+V pastes when the binding is on. Left to xterm it would go out as
+    // ^V (0x16, readline's quoted-insert) and the keydown would be canceled,
+    // so the browser's paste event never fires. Returning false here makes
+    // xterm step aside WITHOUT canceling the event: the browser then runs its
+    // own paste, the same native event Shift+Insert arrives on — no clipboard
+    // read, no permission. Win+V depends on this: Windows delivers the item
+    // picked from its clipboard history as a simulated Ctrl+V in the focused
+    // window (reported behavior, not something a test here can exercise).
+    if (
+      style.ctrlVPaste &&
+      !options.logMode &&
+      event.ctrlKey &&
+      !event.shiftKey &&
+      !event.altKey &&
+      !event.metaKey &&
+      (key === "v" || event.code === "KeyV")
+    ) {
+      return false;
+    }
     // copy: in log mode (no pty) Ctrl/Cmd+C is free; an interactive shell
     // keeps plain Ctrl+C for SIGINT and uses Ctrl+Shift+C instead.
     // Ctrl+Insert is terminal-neutral and enabled everywhere.
@@ -305,6 +326,27 @@ export function createTerminal(
     return true;
   });
 
+  // hint per clipboard-read failure. Shift+Insert is the one paste key that
+  // works everywhere (a native paste event, independent of the host's
+  // clipboard permission and of the Ctrl+V binding), so it is the only key
+  // these hints ever name.
+  const clipboardHints: Record<ClipboardReadFailure, MessageKey> = {
+    unsupported: "clipboardReadUnsupported",
+    denied: "clipboardReadDenied",
+    busy: "clipboardReadBusy",
+    failed: "clipboardUnavailable",
+  };
+  const pasteFromClipboard = (): void => {
+    void readClipboard().then((result) => {
+      if (!result.ok) notify(t(clipboardHints[result.reason]), "error");
+      else if (result.text) terminal.paste(result.text);
+      else notify(t("clipboardNoText"), "info");
+      // the read may have waited on a host dialog or a rate-limit retry, and
+      // keystrokes typed meanwhile must keep landing in this terminal
+      terminal.focus();
+    });
+  };
+
   // stock context menu for interactive terminals (the log viewer installs
   // its own); paste resolves lazily so the menu never blocks on clipboard
   // permissions
@@ -314,15 +356,7 @@ export function createTerminal(
       event.preventDefault();
       const items: MenuItem[] = [
         { label: t("copy"), disabled: !terminal.hasSelection(), action: copySelection },
-        {
-          label: t("paste"),
-          action: () => {
-            void readClipboard().then((text) => {
-              if (text) terminal.paste(text);
-              else notify(t("clipboardUnavailable"), "error");
-            });
-          },
-        },
+        { label: t("paste"), action: pasteFromClipboard },
         { separator: true },
         { label: t("selectAll"), action: () => terminal.selectAll() },
       ];
@@ -376,6 +410,7 @@ export function createTerminal(
       terminal.options.fontFamily = resolveFont(next.fontFamily);
       terminal.options.fontSize = next.fontSize;
       terminal.options.scrollback = next.scrollback;
+      style.ctrlVPaste = next.ctrlVPaste;
       try {
         fitAddon.fit();
       } catch {

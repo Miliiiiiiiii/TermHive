@@ -328,6 +328,7 @@ export async function mountSession(context: SessionContext): Promise<() => void>
         fontFamily: styleState.fontFamily,
         fontSize: styleState.fontSize,
         scrollback: styleState.scrollback,
+        ctrlVPaste: styleState.ctrlVPaste,
       });
     }
   }
@@ -570,6 +571,7 @@ export async function mountSession(context: SessionContext): Promise<() => void>
         fontFamily: styleState.fontFamily,
         fontSize: styleState.fontSize,
         scrollback: styleState.scrollback,
+        ctrlVPaste: styleState.ctrlVPaste,
       },
     });
     tab.term.onData((data) => {
